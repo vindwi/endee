@@ -293,9 +293,9 @@ namespace hnswlib {
                  std::vector<idhInt> l1_eps = {currObj};
                  std::vector<std::pair<dist_t, idhInt>> l1_res;
                  if(deletedElementsCount_) {
-                     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, M_, isIdAllowed, filter_boost_percentage);
+                     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
                  } else {
-                     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, M_, isIdAllowed, filter_boost_percentage);
+                     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
                  }
                  
                  for(size_t i = 0; i < std::min((size_t)2, l1_res.size()); ++i) {

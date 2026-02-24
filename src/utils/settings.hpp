@@ -31,6 +31,7 @@ namespace settings {
     constexpr size_t BACKFILL_BUFFER = 4; // Keep 4 slots free for high quality neighbors
     constexpr size_t MAX_EF_CONSTRUCT = 4096;
     constexpr size_t DEFAULT_EF_SEARCH = 128;
+    constexpr size_t DEFAULT_EF_SEARCH_L1 = 2;
     constexpr size_t MIN_K = 1;
     constexpr size_t MAX_K = 4096;
     constexpr size_t RANDOM_SEED = 100;
