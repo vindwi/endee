@@ -28,7 +28,7 @@ namespace settings {
     constexpr size_t MAX_M = 512;
     constexpr size_t DEFAULT_EF_CONSTRUCT = 128;
     constexpr size_t MIN_EF_CONSTRUCT = 8;
-    constexpr size_t BACKFILL_BUFFER = 2; // Keep 2 slots free for high quality neighbors
+    constexpr size_t BACKFILL_BUFFER = 4; // Keep 4 slots free for high quality neighbors
     constexpr size_t MAX_EF_CONSTRUCT = 4096;
     constexpr size_t DEFAULT_EF_SEARCH = 128;
     constexpr size_t MIN_K = 1;
@@ -89,7 +89,7 @@ namespace settings {
     constexpr size_t DEFAULT_SERVER_PORT = 8080;
     const std::string DEFAULT_SERVER_TYPE = "OSS";
     const std::string DEFAULT_DATA_DIR = "/mnt/data";
-    const std::string DEFAULT_SUBINDEX = "DEFAULT";
+    const std::string DEFAULT_SUBINDEX = "default";
     constexpr size_t DEFAULT_MAX_ACTIVE_INDICES = 64;
     constexpr size_t DEFAULT_MAX_ELEMENTS = 100'000;
     constexpr size_t DEFAULT_MAX_ELEMENTS_INCREMENT = 100'000;
