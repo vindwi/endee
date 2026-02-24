@@ -4,7 +4,6 @@
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
-#include <atomic>
 #include <cstring>
 #include <array>
 #include <limits>
@@ -18,7 +17,6 @@ public:
     inline static size_t VECTOR_CACHE_PERCENTAGE = settings::VECTOR_CACHE_PERCENTAGE;
 
     inline static size_t VECTOR_CACHE_MIN_BITS = settings::VECTOR_CACHE_MIN_BITS;
-    static constexpr uint8_t MAX_COUNTER = 2; // Sticky replacement policy
     // Helper to calculate required cache bits based on element count and percentage
     static size_t calculateCacheBits(size_t element_count, size_t cache_percent = VECTOR_CACHE_PERCENTAGE) {
         if (element_count == 0 || cache_percent == 0) return 0;
@@ -93,18 +91,14 @@ public:
         cacheBits_ = cache_bits;
         cacheSize_ = 1 << cacheBits_;
         cacheMask_ = cacheSize_ - 1;
-        // Layout: [idInt] [uint8_t counter] [data...]
-        vectorCacheDataSize_ = data_size_ + sizeof(idInt) + sizeof(uint8_t);
+        vectorCacheDataSize_ = data_size_ + sizeof(idInt);
         
         vectorCache_ = new uint8_t[cacheSize_ * vectorCacheDataSize_];
         
         // Initialize all entries to INVALID_ID
         for (size_t i = 0; i < cacheSize_; i++) {
-            uint8_t* entry = vectorCache_ + i * vectorCacheDataSize_;
-            idInt* id_ptr = reinterpret_cast<idInt*>(entry);
+            idInt* id_ptr = reinterpret_cast<idInt*>(vectorCache_ + i * vectorCacheDataSize_);
             *id_ptr = INVALID_ID;
-            // Also zero out counter/data for cleanliness
-            *(entry + sizeof(idInt)) = 0;
         }
     }
     
@@ -118,16 +112,7 @@ public:
         
         idInt* stored_id = reinterpret_cast<idInt*>(entry);
         if (*stored_id == internal_id) {
-            // Hit! Reset counter to MAX_COUNTER (stickiness)
-            // Optimization: Only write if currently different to avoid cache line invalidation (False Sharing)
-            uint8_t* counter_ptr = entry + sizeof(idInt);
-            auto atomic_counter = reinterpret_cast<std::atomic<uint8_t>*>(counter_ptr);
-            
-            if (atomic_counter->load(std::memory_order_relaxed) < MAX_COUNTER) {
-                 atomic_counter->store(MAX_COUNTER, std::memory_order_relaxed);
-            }
-
-            memcpy(buffer, entry + sizeof(idInt) + sizeof(uint8_t), data_size_);
+            memcpy(buffer, entry + sizeof(idInt), data_size_);
             return true;
         }
         return false;
@@ -142,39 +127,8 @@ public:
         std::unique_lock<std::shared_mutex> lock(getCacheStripeMutex(index));
         
         idInt* stored_id = reinterpret_cast<idInt*>(entry);
-        // Use atomic consistently to avoid UB, though we are under unique_lock
-        auto atomic_counter = reinterpret_cast<std::atomic<uint8_t>*>(entry + sizeof(idInt));
-        uint8_t* data_ptr = entry + sizeof(idInt) + sizeof(uint8_t);
-
-        if (*stored_id == internal_id) {
-            // Update existing
-            atomic_counter->store(MAX_COUNTER, std::memory_order_relaxed);
-            memcpy(data_ptr, data, data_size_);
-            return;
-        }
-        
-        if (*stored_id == INVALID_ID) {
-            // Empty slot
-            *stored_id = internal_id;
-            atomic_counter->store(MAX_COUNTER, std::memory_order_relaxed);
-            memcpy(data_ptr, data, data_size_);
-            return;
-        }
-
-        // Collision with different vector
-        uint8_t c = atomic_counter->load(std::memory_order_relaxed);
-        if (c > 0) {
-            c--;
-            atomic_counter->store(c, std::memory_order_relaxed);
-        }
-        
-        if (c == 0) {
-            // Replace
-            *stored_id = internal_id;
-            atomic_counter->store(MAX_COUNTER, std::memory_order_relaxed);
-            memcpy(data_ptr, data, data_size_);
-        }
-        // Else: reject new vector, keep old one (thrashing protection)
+        *stored_id = internal_id;
+        memcpy(entry + sizeof(idInt), data, data_size_);
     }
     
     size_t getCacheBits() const { return cacheBits_; }

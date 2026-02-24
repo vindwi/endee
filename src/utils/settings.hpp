@@ -28,7 +28,7 @@ namespace settings {
     constexpr size_t MAX_M = 512;
     constexpr size_t DEFAULT_EF_CONSTRUCT = 128;
     constexpr size_t MIN_EF_CONSTRUCT = 8;
-    constexpr size_t BACKFILL_BUFFER = 4; // Keep 4 slots free for high quality neighbors
+    constexpr size_t BACKFILL_BUFFER = 4; // Keep 3 slots free for high quality neighbors
     constexpr size_t MAX_EF_CONSTRUCT = 4096;
     constexpr size_t DEFAULT_EF_SEARCH = 128;
     constexpr size_t DEFAULT_EF_SEARCH_L1 = 2;
@@ -42,9 +42,6 @@ namespace settings {
     constexpr size_t NUM_SERVER_THREADS = 0;
     // Number of save mutexes for parallel saves
     constexpr size_t NUM_INDEX_SAVE_MUTEXES = 16;
-
-    // We allow some extra neighbors before pruning
-    constexpr size_t MAX_EXTRA_NEIGHBORS = 3;
 
     // MDBX default map sizes. Growth step and initial size are the same for all databases.
     // System tables
@@ -66,8 +63,6 @@ namespace settings {
     constexpr uint16_t MAX_BLOCK_SIZE = 128;    // Number of elements in a block
     constexpr uint32_t DEFAULT_VOCAB_SIZE = 0;  // 0 means dense vectors only
     constexpr uint8_t DEFAULT_QUANT_BITS = 8;
-    constexpr uint16_t BLOCK_SPLIT_THRESHOLD =
-            160;  // Bloc will be split if more than this many elements (including tombstones)
 
     // Maximum number of elements in the index
     constexpr size_t MAX_VECTORS_ADMIN = 1'000'000'000;
@@ -90,7 +85,7 @@ namespace settings {
     constexpr size_t DEFAULT_SERVER_PORT = 8080;
     const std::string DEFAULT_SERVER_TYPE = "OSS";
     const std::string DEFAULT_DATA_DIR = "/mnt/data";
-    const std::string DEFAULT_SUBINDEX = "DEFAULT";
+    const std::string DEFAULT_SUBINDEX = "default";
     constexpr size_t DEFAULT_MAX_ACTIVE_INDICES = 64;
     constexpr size_t DEFAULT_MAX_ELEMENTS = 100'000;
     constexpr size_t DEFAULT_MAX_ELEMENTS_INCREMENT = 100'000;
