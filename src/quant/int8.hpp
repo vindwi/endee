@@ -776,21 +776,60 @@ namespace ndd {
                 size_t i = 0;
 
 #if defined(USE_AVX512)
-                __m512i v_sum = _mm512_setzero_si512();
-                for(; i + 32 <= qty; i += 32) {
-                    __m256i v1_256 = _mm256_loadu_si256((const __m256i*)(pVect1 + i));
-                    __m256i v2_256 = _mm256_loadu_si256((const __m256i*)(pVect2 + i));
+                __m512i dot_acc0 = _mm512_setzero_si512();
+                __m512i dot_acc1 = _mm512_setzero_si512();
+                __m512i dot_acc2 = _mm512_setzero_si512();
+                __m512i dot_acc3 = _mm512_setzero_si512();
+                __m512i sum2_acc0 = _mm512_setzero_si512();
+                __m512i sum2_acc1 = _mm512_setzero_si512();
+                __m512i sum2_acc2 = _mm512_setzero_si512();
+                __m512i sum2_acc3 = _mm512_setzero_si512();
+                const __m512i sign_flip = _mm512_set1_epi8(static_cast<char>(0x80));
+                const __m512i ones_u8 = _mm512_set1_epi8(static_cast<char>(0x01));
 
-                    // Sign extend to 16-bit
-                    __m512i v1_512 = _mm512_cvtepi8_epi16(v1_256);
-                    __m512i v2_512 = _mm512_cvtepi8_epi16(v2_256);
+                for(; i + 256 <= qty; i += 256) {
+                    __m512i v1_0 = _mm512_loadu_si512((const __m512i*)(pVect1 + i));
+                    __m512i v2_0 = _mm512_loadu_si512((const __m512i*)(pVect2 + i));
+                    __m512i v1_1 = _mm512_loadu_si512((const __m512i*)(pVect1 + i + 64));
+                    __m512i v2_1 = _mm512_loadu_si512((const __m512i*)(pVect2 + i + 64));
+                    __m512i v1_2 = _mm512_loadu_si512((const __m512i*)(pVect1 + i + 128));
+                    __m512i v2_2 = _mm512_loadu_si512((const __m512i*)(pVect2 + i + 128));
+                    __m512i v1_3 = _mm512_loadu_si512((const __m512i*)(pVect1 + i + 192));
+                    __m512i v2_3 = _mm512_loadu_si512((const __m512i*)(pVect2 + i + 192));
 
-                    // Multiply and add adjacent pairs (produces 32-bit integers)
-                    __m512i prod = _mm512_madd_epi16(v1_512, v2_512);
+                    __m512i v1_u8_0 = _mm512_xor_si512(v1_0, sign_flip);
+                    __m512i v1_u8_1 = _mm512_xor_si512(v1_1, sign_flip);
+                    __m512i v1_u8_2 = _mm512_xor_si512(v1_2, sign_flip);
+                    __m512i v1_u8_3 = _mm512_xor_si512(v1_3, sign_flip);
 
-                    v_sum = _mm512_add_epi32(v_sum, prod);
+                    dot_acc0 = _mm512_dpbusd_epi32(dot_acc0, v1_u8_0, v2_0);
+                    dot_acc1 = _mm512_dpbusd_epi32(dot_acc1, v1_u8_1, v2_1);
+                    dot_acc2 = _mm512_dpbusd_epi32(dot_acc2, v1_u8_2, v2_2);
+                    dot_acc3 = _mm512_dpbusd_epi32(dot_acc3, v1_u8_3, v2_3);
+
+                    sum2_acc0 = _mm512_dpbusd_epi32(sum2_acc0, ones_u8, v2_0);
+                    sum2_acc1 = _mm512_dpbusd_epi32(sum2_acc1, ones_u8, v2_1);
+                    sum2_acc2 = _mm512_dpbusd_epi32(sum2_acc2, ones_u8, v2_2);
+                    sum2_acc3 = _mm512_dpbusd_epi32(sum2_acc3, ones_u8, v2_3);
                 }
-                sum = _mm512_reduce_add_epi32(v_sum);
+
+                __m512i dot_acc = _mm512_add_epi32(_mm512_add_epi32(dot_acc0, dot_acc1),
+                                                   _mm512_add_epi32(dot_acc2, dot_acc3));
+                __m512i sum2_acc = _mm512_add_epi32(_mm512_add_epi32(sum2_acc0, sum2_acc1),
+                                                    _mm512_add_epi32(sum2_acc2, sum2_acc3));
+
+                for(; i + 64 <= qty; i += 64) {
+                    __m512i v1 = _mm512_loadu_si512((const __m512i*)(pVect1 + i));
+                    __m512i v2 = _mm512_loadu_si512((const __m512i*)(pVect2 + i));
+
+                    __m512i v1_u8 = _mm512_xor_si512(v1, sign_flip);
+                    dot_acc = _mm512_dpbusd_epi32(dot_acc, v1_u8, v2);
+                    sum2_acc = _mm512_dpbusd_epi32(sum2_acc, ones_u8, v2);
+                }
+
+                int32_t dot_u = _mm512_reduce_add_epi32(dot_acc);
+                int32_t sum2 = _mm512_reduce_add_epi32(sum2_acc);
+                sum = dot_u - 128 * sum2;
 #elif defined(USE_AVX2)
                 __m256i v_sum = _mm256_setzero_si256();
                 for(; i + 16 <= qty; i += 16) {

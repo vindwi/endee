@@ -952,69 +952,64 @@ namespace ndd {
                 sum_vec0 = vaddq_s64(sum_vec0, sum_vec2);
                 sum = vgetq_lane_s64(sum_vec0, 0) + vgetq_lane_s64(sum_vec0, 1);
 #elif defined(USE_SVE2)
-                uint64_t num_elements = svcnth();
-                size_t unroll_stride = num_elements * 4;
-                svbool_t pg_all = svptrue_b16();
-                svbool_t pg_64 = svptrue_b64();
-                svint32_t zero_s32 = svdup_s32(0);
+                int64x2_t sum_vec0 = vdupq_n_s64(0);
+                int64x2_t sum_vec1 = vdupq_n_s64(0);
+                int64x2_t sum_vec2 = vdupq_n_s64(0);
+                int64x2_t sum_vec3 = vdupq_n_s64(0);
 
-                svint64_t sum0 = svdup_s64(0);
-                svint64_t sum1 = svdup_s64(0);
-                svint64_t sum2 = svdup_s64(0);
-                svint64_t sum3 = svdup_s64(0);
+                size_t qty32 = qty / 32;
+                for(; i < qty32 * 32; i += 32) {
+                    int16x8_t v1_0 = vld1q_s16(pVect1 + i);
+                    int16x8_t v2_0 = vld1q_s16(pVect2 + i);
+                    int32x4_t prod0_lo = vmull_s16(vget_low_s16(v1_0), vget_low_s16(v2_0));
+                    int32x4_t prod0_hi = vmull_s16(vget_high_s16(v1_0), vget_high_s16(v2_0));
+                    sum_vec0 = vpadalq_s32(sum_vec0, prod0_lo);
+                    sum_vec0 = vpadalq_s32(sum_vec0, prod0_hi);
 
-                for(; i + unroll_stride <= qty; i += unroll_stride) {
-                    svint16_t v1_0 = svld1_s16(pg_all, pVect1 + i);
-                    svint16_t v2_0 = svld1_s16(pg_all, pVect2 + i);
-                    svint32_t p_lo_0 = svmlalb_s32(zero_s32, v1_0, v2_0);
-                    svint32_t p_hi_0 = svmlalt_s32(zero_s32, v1_0, v2_0);
-                    sum0 = svadd_s64_x(pg_64, sum0, svaddlb_s64(p_lo_0, zero_s32));
-                    sum1 = svadd_s64_x(pg_64, sum1, svaddlt_s64(p_lo_0, zero_s32));
-                    sum2 = svadd_s64_x(pg_64, sum2, svaddlb_s64(p_hi_0, zero_s32));
-                    sum3 = svadd_s64_x(pg_64, sum3, svaddlt_s64(p_hi_0, zero_s32));
+                    int16x8_t v1_1 = vld1q_s16(pVect1 + i + 8);
+                    int16x8_t v2_1 = vld1q_s16(pVect2 + i + 8);
+                    int32x4_t prod1_lo = vmull_s16(vget_low_s16(v1_1), vget_low_s16(v2_1));
+                    int32x4_t prod1_hi = vmull_s16(vget_high_s16(v1_1), vget_high_s16(v2_1));
+                    sum_vec1 = vpadalq_s32(sum_vec1, prod1_lo);
+                    sum_vec1 = vpadalq_s32(sum_vec1, prod1_hi);
 
-                    svint16_t v1_1 = svld1_s16(pg_all, pVect1 + i + num_elements);
-                    svint16_t v2_1 = svld1_s16(pg_all, pVect2 + i + num_elements);
-                    svint32_t p_lo_1 = svmlalb_s32(zero_s32, v1_1, v2_1);
-                    svint32_t p_hi_1 = svmlalt_s32(zero_s32, v1_1, v2_1);
-                    sum0 = svadd_s64_x(pg_64, sum0, svaddlb_s64(p_lo_1, zero_s32));
-                    sum1 = svadd_s64_x(pg_64, sum1, svaddlt_s64(p_lo_1, zero_s32));
-                    sum2 = svadd_s64_x(pg_64, sum2, svaddlb_s64(p_hi_1, zero_s32));
-                    sum3 = svadd_s64_x(pg_64, sum3, svaddlt_s64(p_hi_1, zero_s32));
+                    int16x8_t v1_2 = vld1q_s16(pVect1 + i + 16);
+                    int16x8_t v2_2 = vld1q_s16(pVect2 + i + 16);
+                    int32x4_t prod2_lo = vmull_s16(vget_low_s16(v1_2), vget_low_s16(v2_2));
+                    int32x4_t prod2_hi = vmull_s16(vget_high_s16(v1_2), vget_high_s16(v2_2));
+                    sum_vec2 = vpadalq_s32(sum_vec2, prod2_lo);
+                    sum_vec2 = vpadalq_s32(sum_vec2, prod2_hi);
 
-                    svint16_t v1_2 = svld1_s16(pg_all, pVect1 + i + 2 * num_elements);
-                    svint16_t v2_2 = svld1_s16(pg_all, pVect2 + i + 2 * num_elements);
-                    svint32_t p_lo_2 = svmlalb_s32(zero_s32, v1_2, v2_2);
-                    svint32_t p_hi_2 = svmlalt_s32(zero_s32, v1_2, v2_2);
-                    sum0 = svadd_s64_x(pg_64, sum0, svaddlb_s64(p_lo_2, zero_s32));
-                    sum1 = svadd_s64_x(pg_64, sum1, svaddlt_s64(p_lo_2, zero_s32));
-                    sum2 = svadd_s64_x(pg_64, sum2, svaddlb_s64(p_hi_2, zero_s32));
-                    sum3 = svadd_s64_x(pg_64, sum3, svaddlt_s64(p_hi_2, zero_s32));
-
-                    svint16_t v1_3 = svld1_s16(pg_all, pVect1 + i + 3 * num_elements);
-                    svint16_t v2_3 = svld1_s16(pg_all, pVect2 + i + 3 * num_elements);
-                    svint32_t p_lo_3 = svmlalb_s32(zero_s32, v1_3, v2_3);
-                    svint32_t p_hi_3 = svmlalt_s32(zero_s32, v1_3, v2_3);
-                    sum0 = svadd_s64_x(pg_64, sum0, svaddlb_s64(p_lo_3, zero_s32));
-                    sum1 = svadd_s64_x(pg_64, sum1, svaddlt_s64(p_lo_3, zero_s32));
-                    sum2 = svadd_s64_x(pg_64, sum2, svaddlb_s64(p_hi_3, zero_s32));
-                    sum3 = svadd_s64_x(pg_64, sum3, svaddlt_s64(p_hi_3, zero_s32));
+                    int16x8_t v1_3 = vld1q_s16(pVect1 + i + 24);
+                    int16x8_t v2_3 = vld1q_s16(pVect2 + i + 24);
+                    int32x4_t prod3_lo = vmull_s16(vget_low_s16(v1_3), vget_low_s16(v2_3));
+                    int32x4_t prod3_hi = vmull_s16(vget_high_s16(v1_3), vget_high_s16(v2_3));
+                    sum_vec3 = vpadalq_s32(sum_vec3, prod3_lo);
+                    sum_vec3 = vpadalq_s32(sum_vec3, prod3_hi);
                 }
 
-                svint64_t sum_vec = svadd_s64_x(svptrue_b64(), sum0, sum1);
-                sum_vec = svadd_s64_x(svptrue_b64(), sum_vec, sum2);
-                sum_vec = svadd_s64_x(svptrue_b64(), sum_vec, sum3);
+                size_t qty16 = qty / 16;
+                for(; i < qty16 * 16; i += 16) {
+                    int16x8_t v1_0 = vld1q_s16(pVect1 + i);
+                    int16x8_t v2_0 = vld1q_s16(pVect2 + i);
+                    int16x8_t v1_1 = vld1q_s16(pVect1 + i + 8);
+                    int16x8_t v2_1 = vld1q_s16(pVect2 + i + 8);
 
-                svbool_t pg = svwhilelt_b64(i, qty);
-                while(svptest_any(svptrue_b64(), pg)) {
-                    svint64_t v1 = svld1sh_s64(pg, pVect1 + i);
-                    svint64_t v2 = svld1sh_s64(pg, pVect2 + i);
-                    svint64_t prod = svmul_s64_x(pg, v1, v2);
-                    sum_vec = svadd_s64_x(pg, sum_vec, prod);
-                    i += svcntd();
-                    pg = svwhilelt_b64(i, qty);
+                    int32x4_t prod0_lo = vmull_s16(vget_low_s16(v1_0), vget_low_s16(v2_0));
+                    int32x4_t prod0_hi = vmull_s16(vget_high_s16(v1_0), vget_high_s16(v2_0));
+                    int32x4_t prod1_lo = vmull_s16(vget_low_s16(v1_1), vget_low_s16(v2_1));
+                    int32x4_t prod1_hi = vmull_s16(vget_high_s16(v1_1), vget_high_s16(v2_1));
+
+                    sum_vec0 = vpadalq_s32(sum_vec0, prod0_lo);
+                    sum_vec0 = vpadalq_s32(sum_vec0, prod0_hi);
+                    sum_vec1 = vpadalq_s32(sum_vec1, prod1_lo);
+                    sum_vec1 = vpadalq_s32(sum_vec1, prod1_hi);
                 }
-                sum = svaddv_s64(svptrue_b64(), sum_vec);
+
+                sum_vec0 = vaddq_s64(sum_vec0, sum_vec1);
+                sum_vec2 = vaddq_s64(sum_vec2, sum_vec3);
+                sum_vec0 = vaddq_s64(sum_vec0, sum_vec2);
+                sum = vgetq_lane_s64(sum_vec0, 0) + vgetq_lane_s64(sum_vec0, 1);
 #endif
 
                 for(; i < qty; i++) {
