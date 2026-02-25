@@ -101,6 +101,8 @@ namespace hnswlib {
             if (cache_bits > 0) {
                 vector_cache_ = std::make_unique<VectorCache>(data_size_, cache_bits);
                 LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1 << cache_bits) << " slots");
+                size_t cache_bytes = vector_cache_->getMemoryUsage();
+                LOG_DEBUG("Vector cache allocated: " << cache_bytes << " bytes (" << (cache_bytes / MB) << " MB)");
             }
 
             // Initialize upper layer space
@@ -486,9 +488,10 @@ namespace hnswlib {
 
             // Initialize cache for loaded index
             size_t cache_bits = VectorCache::calculateCacheBits(maxElements_);
+            LOG_INFO("Calculated cache bits for loaded index: " << cache_bits);
             if (cache_bits > 0) {
                  vector_cache_ = std::make_unique<VectorCache>(data_size_, cache_bits);
-                 LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1 << cache_bits) << " slots");
+                 LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1ULL << cache_bits) << " slots");
             }
 
               data_size_upper_ = space_upper_->get_data_size();
@@ -624,7 +627,11 @@ namespace hnswlib {
 
             // Put the data in cache. Will speed up initial data load
             if (vector_cache_) {
-                vector_cache_->insert(cur_c, static_cast<const uint8_t*>(datapoint));
+                std::unique_lock<std::shared_timed_mutex> write_lock(
+                        getCacheMutex(cur_c), std::try_to_lock);
+                if(write_lock.owns_lock()) {
+                    vector_cache_->insertNoLock(cur_c, static_cast<const uint8_t*>(datapoint));
+                }
             }
 
             // std::unique_lock <std::shared_mutex> lock_el(getLinkListMutex(cur_c));
@@ -848,6 +855,28 @@ namespace hnswlib {
 
         // Cache for vectors
         mutable std::unique_ptr<VectorCache> vector_cache_;
+        static constexpr size_t CACHE_LOCK_STRIPE_BITS = 8; // 256 striped locks in HNSW
+        static constexpr size_t CACHE_LOCK_STRIPE_COUNT = 1 << CACHE_LOCK_STRIPE_BITS;
+        static constexpr size_t CACHE_LOCK_STRIPE_MASK = CACHE_LOCK_STRIPE_COUNT - 1;
+        mutable std::array<std::shared_timed_mutex, CACHE_LOCK_STRIPE_COUNT> vectorCacheLocks_;
+
+        struct CacheReadView {
+            std::shared_lock<std::shared_timed_mutex> lock;
+            const uint8_t* data = nullptr;
+
+            explicit operator bool() const {
+                return data != nullptr;
+            }
+        };
+
+        std::shared_timed_mutex& getCacheMutex(idhInt internal_id) const {
+            size_t cache_index = static_cast<size_t>(internal_id);
+            if(vector_cache_) {
+                cache_index = vector_cache_->getCacheIndex(internal_id);
+            }
+            size_t stripe_id = cache_index & CACHE_LOCK_STRIPE_MASK;
+            return vectorCacheLocks_[stripe_id];
+        }
 
     public:
         const VectorCache* getCache() const {
@@ -894,22 +923,52 @@ namespace hnswlib {
             return dataUpperLayer_[internal_id].get();
         }
 
-        // Modified function returning bool and filling buffer
-        bool getDataByInternalId(idhInt internal_id, levelInt layer, uint8_t* buffer) const {
+        // Modified function returning bool and filling buffer.
+        // For layer 0, callers can optionally receive zero-copy cache hits via cache_read_handle.
+        bool getDataByInternalId(idhInt internal_id,
+                                 levelInt layer,
+                                 uint8_t* buffer,
+                                 CacheReadView* cache_read_handle = nullptr) const {
+            if(cache_read_handle) {
+                *cache_read_handle = CacheReadView();
+            }
+
             if(layer == 0) {
                 // Check cache first
-                if (vector_cache_ && vector_cache_->get(internal_id, buffer)) {
-                    return true;
+                if(vector_cache_) {
+                    if(cache_read_handle) {
+                        cache_read_handle->lock =
+                                std::shared_lock<std::shared_timed_mutex>(getCacheMutex(internal_id));
+                        const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_id);
+                        if(cached_ptr) {
+                            cache_read_handle->data = cached_ptr;
+                            return true;
+                        }
+                        cache_read_handle->lock.unlock();
+                    }
+
+                    if(buffer) {
+                        std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_id));
+                        const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_id);
+                        if(cached_ptr) {
+                            memcpy(buffer, cached_ptr, data_size_);
+                            return true;
+                        }
+                    }
                 }
 
                 idInt external_label = getExternalLabel(internal_id);
-                if(vector_fetcher_) {
+                if(vector_fetcher_ && buffer) {
                     // Directly fetch to buffer
                     bool success = vector_fetcher_(external_label, buffer);
                     
                     // Populate cache on successful fetch
                     if (success && vector_cache_) {
-                         vector_cache_->insert(internal_id, buffer);
+                        std::unique_lock<std::shared_timed_mutex> write_lock(
+                                getCacheMutex(internal_id), std::try_to_lock);
+                        if(write_lock.owns_lock()) {
+                            vector_cache_->insertNoLock(internal_id, buffer);
+                        }
                     }
                     return success;
                 }
@@ -940,13 +999,19 @@ namespace hnswlib {
 
             for(size_t i = 0; i < count; i++) {
                 uint8_t* buf = buffers + i * data_size_;
-                if(vector_cache_ && vector_cache_->get(internal_ids[i], buf)) {
-                    success[i] = true;
-                } else {
-                    success[i] = false;
-                    miss_indices.push_back(i);
-                    miss_labels.push_back(getExternalLabel(internal_ids[i]));
+                if(vector_cache_) {
+                    std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_ids[i]));
+                    const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_ids[i]);
+                    if(cached_ptr) {
+                        std::memcpy(buf, cached_ptr, data_size_);
+                        success[i] = true;
+                        continue;
+                    }
                 }
+
+                success[i] = false;
+                miss_indices.push_back(i);
+                miss_labels.push_back(getExternalLabel(internal_ids[i]));
             }
 
             // Phase 2: Batch fetch all misses in one MDBX txn
@@ -968,7 +1033,11 @@ namespace hnswlib {
                         success[i] = true;
                         // Populate cache
                         if(vector_cache_) {
-                            vector_cache_->insert(internal_ids[i], buf);
+                            std::unique_lock<std::shared_timed_mutex> write_lock(
+                                    getCacheMutex(internal_ids[i]), std::try_to_lock);
+                            if(write_lock.owns_lock()) {
+                                vector_cache_->insertNoLock(internal_ids[i], buf);
+                            }
                         }
                     }
                 }
@@ -980,7 +1049,11 @@ namespace hnswlib {
                     bool ok = vector_fetcher_(miss_labels[mi], buf);
                     success[i] = ok;
                     if(ok && vector_cache_) {
-                        vector_cache_->insert(internal_ids[i], buf);
+                        std::unique_lock<std::shared_timed_mutex> write_lock(
+                                getCacheMutex(internal_ids[i]), std::try_to_lock);
+                        if(write_lock.owns_lock()) {
+                            vector_cache_->insertNoLock(internal_ids[i], buf);
+                        }
                     }
                 }
             }
@@ -1134,9 +1207,15 @@ namespace hnswlib {
                 }
 
                 const void* cand_vec = nullptr;
+                CacheReadView cand_cache_handle;
                 if(level == 0) {
-                    if(getDataByInternalId(candidate.second, level, cand_buf.data())) {
-                        cand_vec = cand_buf.data();
+                    if(getDataByInternalId(candidate.second,
+                                           level,
+                                           cand_buf.data(),
+                                           &cand_cache_handle)) {
+                        cand_vec = cand_cache_handle
+                                   ? static_cast<const void*>(cand_cache_handle.data)
+                                   : static_cast<const void*>(cand_buf.data());
                     }
                 } else {
                     cand_vec = getUpperLayerDataPtr(candidate.second);
@@ -1259,9 +1338,15 @@ namespace hnswlib {
                     setListCount(ll_other, sz + 1);
                 } else {
                     const void* neighbor_data = nullptr;
+                    CacheReadView neighbor_cache_handle;
                     if(level == 0) {
-                        if(getDataByInternalId(neighbor, level, neighbor_buf.data())) {
-                            neighbor_data = neighbor_buf.data();
+                        if(getDataByInternalId(neighbor,
+                                               level,
+                                               neighbor_buf.data(),
+                                               &neighbor_cache_handle)) {
+                            neighbor_data = neighbor_cache_handle
+                                            ? static_cast<const void*>(neighbor_cache_handle.data)
+                                            : static_cast<const void*>(neighbor_buf.data());
                         }
                     } else {
                         neighbor_data = getUpperLayerDataPtr(neighbor);
@@ -1280,9 +1365,15 @@ namespace hnswlib {
                     for(size_t j = 0; j < sz; j++) {
                         dist_t sim;
                         const void* other_neighbor_data = nullptr;
+                        CacheReadView other_cache_handle;
                         if(level == 0) {
-                            if(getDataByInternalId(data[j], level, data_buf.data())) {
-                                other_neighbor_data = data_buf.data();
+                            if(getDataByInternalId(data[j],
+                                                   level,
+                                                   data_buf.data(),
+                                                   &other_cache_handle)) {
+                                other_neighbor_data = other_cache_handle
+                                                      ? static_cast<const void*>(other_cache_handle.data)
+                                                      : static_cast<const void*>(data_buf.data());
                             }
                         } else {
                             other_neighbor_data = getUpperLayerDataPtr(data[j]);
@@ -1349,9 +1440,15 @@ namespace hnswlib {
                 dist_t sim = std::numeric_limits<dist_t>::lowest();
                 if(!has_deletions || !isMarkedDeleted(ep_id)) {
                     const void* vec_data = nullptr;
+                    CacheReadView ep_cache_handle;
                     if(layer == 0) {
-                        if(getDataByInternalId(ep_id, layer, buffer.data())) {
-                            vec_data = buffer.data();
+                        if(getDataByInternalId(ep_id,
+                                               layer,
+                                               buffer.data(),
+                                               &ep_cache_handle)) {
+                            vec_data = ep_cache_handle
+                                       ? static_cast<const void*>(ep_cache_handle.data)
+                                       : static_cast<const void*>(buffer.data());
                         }
                     } else {
                         vec_data = getUpperLayerDataPtr(ep_id);
