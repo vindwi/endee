@@ -44,6 +44,10 @@ namespace hnswlib {
                                                 std::vector<distance_type>,
                                                 CompareBySecond<distance_type>>;
         using VectorFetcher = std::function<bool(idInt, uint8_t*)>;
+        // Batch fetcher: fetches multiple vectors in one MDBX txn
+        // Args: labels array, output buffers (flat, count*vector_size), success flags, count
+        // Returns: number of successful fetches
+        using VectorFetcherBatch = std::function<size_t(const idInt*, uint8_t*, bool*, size_t)>;
 
     public:
         // Constructors and destructor
@@ -166,6 +170,7 @@ namespace hnswlib {
         SpaceInterface<dist_t>* getSpace() const { return space_.get(); }
         size_t getDataSize() const { return data_size_; }
         void setVectorFetcher(VectorFetcher fetcher) { vector_fetcher_ = fetcher; }
+        void setVectorFetcherBatch(VectorFetcherBatch fetcher) { vector_fetcher_batch_ = fetcher; }
         size_t getDimension() const { return dimension_; }
         size_t getM() const { return M_; }
         size_t getEfConstruction() const { return efConstruction_; }
@@ -783,6 +788,7 @@ namespace hnswlib {
         size_t dimension_;
 
         VectorFetcher vector_fetcher_;
+        VectorFetcherBatch vector_fetcher_batch_;
         mutable std::shared_mutex index_lock_;
 
         size_t maxElements_{0};
@@ -901,6 +907,67 @@ namespace hnswlib {
                 return true;
             }
             return false;
+        }
+
+        // Batch fetch for level 0: check cache first, then fetch all misses in one MDBX txn.
+        // internal_ids: array of internal IDs to fetch
+        // buffers: flat output buffer, count * data_size_ bytes
+        // success: output array of bools
+        // count: number of IDs
+        void getDataByInternalIdBatch(const idhInt* internal_ids, uint8_t* buffers,
+                                       bool* success, size_t count) const {
+            // Phase 1: Check cache for all IDs, collect misses
+            std::vector<size_t> miss_indices;      // index into the batch
+            std::vector<idInt> miss_labels;         // external labels for MDBX lookup
+            miss_indices.reserve(count);
+            miss_labels.reserve(count);
+
+            for(size_t i = 0; i < count; i++) {
+                uint8_t* buf = buffers + i * data_size_;
+                if(vector_cache_ && vector_cache_->get(internal_ids[i], buf)) {
+                    success[i] = true;
+                } else {
+                    success[i] = false;
+                    miss_indices.push_back(i);
+                    miss_labels.push_back(getExternalLabel(internal_ids[i]));
+                }
+            }
+
+            // Phase 2: Batch fetch all misses in one MDBX txn
+            if(!miss_indices.empty() && vector_fetcher_batch_) {
+                // Temp buffers for the batch fetch
+                std::vector<uint8_t> miss_buffers(miss_indices.size() * data_size_);
+                auto miss_success = std::make_unique<bool[]>(miss_indices.size());
+                std::memset(miss_success.get(), 0, miss_indices.size() * sizeof(bool));
+
+                vector_fetcher_batch_(miss_labels.data(), miss_buffers.data(),
+                                      miss_success.get(), miss_indices.size());
+
+                // Phase 3: Copy results back and populate cache
+                for(size_t mi = 0; mi < miss_indices.size(); mi++) {
+                    size_t i = miss_indices[mi];
+                    if(miss_success[mi]) {
+                        uint8_t* buf = buffers + i * data_size_;
+                        std::memcpy(buf, miss_buffers.data() + mi * data_size_, data_size_);
+                        success[i] = true;
+                        // Populate cache
+                        if(vector_cache_) {
+                            vector_cache_->insert(internal_ids[i], buf);
+                        }
+                    }
+                }
+            } else if(!miss_indices.empty() && vector_fetcher_) {
+                // Fallback: single-fetch for each miss
+                for(size_t mi = 0; mi < miss_indices.size(); mi++) {
+                    size_t i = miss_indices[mi];
+                    uint8_t* buf = buffers + i * data_size_;
+                    bool ok = vector_fetcher_(miss_labels[mi], buf);
+                    success[i] = ok;
+                    if(ok && vector_cache_) {
+                        vector_cache_->insert(internal_ids[i], buf);
+                    }
+                }
+            }
         }
 
         char* get_linklist0(idhInt internal_id) const {
@@ -1287,83 +1354,131 @@ namespace hnswlib {
                 idhInt size = getListCount((idhInt*)data);
                 idhInt* datal = (idhInt*)(data + 1);
 
-                for(idhInt j = 0; j < size; j++) {
-                    idhInt candidate_id = *(datal + j);
-                    if(visited_array[candidate_id] == visited_array_tag) {
-                        continue;
-                    }
-                    visited_array[candidate_id] = visited_array_tag;
-                    if(has_deletions && isMarkedDeleted(candidate_id)) {
-                        continue;
-                    }
-
-                    dist_t sim;
-                    const void* neighbor_data = nullptr;
-                    if(layer == 0) {
-                        if(getDataByInternalId(candidate_id, layer, buffer.data())) {
-                            neighbor_data = buffer.data();
-                        }
-                    } else {
-                        neighbor_data = getUpperLayerDataPtr(candidate_id);
+                // --- Batch prefetch path for layer 0 ---
+                if(layer == 0) {
+                    // Phase 1: Collect valid (non-visited, non-deleted) candidate IDs
+                    std::vector<idhInt> valid_ids;
+                    valid_ids.reserve(size);
+                    for(idhInt j = 0; j < size; j++) {
+                        idhInt candidate_id = *(datal + j);
+                        if(visited_array[candidate_id] == visited_array_tag) continue;
+                        visited_array[candidate_id] = visited_array_tag;
+                        if(has_deletions && isMarkedDeleted(candidate_id)) continue;
+                        valid_ids.push_back(candidate_id);
                     }
 
-                    if(!neighbor_data) {
-                        continue;
-                    }
+                    if(valid_ids.empty()) continue;
 
-                    // Check filter BEFORE computing distance
-                    // Treats filtered nodes as non-existent (traverses a subgraph)
-                    bool pass_filter = true;
-                    if constexpr(!std::is_same_v<FilterFunctor, void>) {
-                        if (filter != nullptr) {
-                            if (!(*filter)(getExternalLabel(candidate_id))) {
-                                pass_filter = false;
+                    // Phase 2: Batch fetch all vectors
+                    std::vector<uint8_t> batch_buffers(valid_ids.size() * data_size_);
+                    auto batch_success = std::make_unique<bool[]>(valid_ids.size());
+                    std::memset(batch_success.get(), 0, valid_ids.size() * sizeof(bool));
+                    getDataByInternalIdBatch(valid_ids.data(), batch_buffers.data(),
+                                             batch_success.get(), valid_ids.size());
+
+                    // Phase 3: Process fetched vectors
+                    for(size_t vi = 0; vi < valid_ids.size(); vi++) {
+                        if(!batch_success[vi]) continue;
+
+                        idhInt candidate_id = valid_ids[vi];
+                        const void* neighbor_data = batch_buffers.data() + vi * data_size_;
+
+                        // Check filter BEFORE computing distance
+                        bool pass_filter = true;
+                        if constexpr(!std::is_same_v<FilterFunctor, void>) {
+                            if (filter != nullptr) {
+                                if (!(*filter)(getExternalLabel(candidate_id))) {
+                                    pass_filter = false;
+                                }
                             }
                         }
-                    }
 
-                    if(!pass_filter) {
-                        // Check Fatigue
-                        if (dist_computations > fatigue_base) {
-                            // We are in the tapering region
-                            // Linearly increase drop probability from 0% to 100%.
-                            
-                            size_t excess = dist_computations - fatigue_base;
-                            
-                            if (excess >= fatigue_tail) {
-                                continue; // 100% drop (Hard Cap exceeded)
+                        dist_t sim;
+                        if(!pass_filter) {
+                            // Check Fatigue
+                            if (dist_computations > fatigue_base) {
+                                size_t excess = dist_computations - fatigue_base;
+                                if (excess >= fatigue_tail) continue;
+                                size_t drop_prob = (excess * 255) / fatigue_tail;
+                                size_t hash = (candidate_id * 104729) & 0xFF;
+                                if (hash < drop_prob) continue;
                             }
-
-                            // Prob = Excess / Tail_Length
-                            size_t drop_prob = (excess * 255) / fatigue_tail; 
-                            
-                            size_t hash = (candidate_id * 104729) & 0xFF;
-                            if (hash < drop_prob) continue;
+                            // Explore
+                            sim = curSimFunc(data_point, neighbor_data, curDistParam);
+                            dist_computations++;
+                            if (top_candidates.size() < ef || sim > lowerBound) {
+                                candidate_set.emplace(sim, candidate_id);
+                            }
+                            continue;
                         }
-                             
-                        // Explore
+
                         sim = curSimFunc(data_point, neighbor_data, curDistParam);
                         dist_computations++;
-                        if (top_candidates.size() < ef || sim > lowerBound) {
+
+                        if(top_candidates.size() < ef || sim > lowerBound) {
                             candidate_set.emplace(sim, candidate_id);
+                            if(!has_deletions || !isMarkedDeleted(candidate_id)) {
+                                top_candidates.emplace(sim, candidate_id);
+                                if(top_candidates.size() > ef) {
+                                    top_candidates.pop();
+                                }
+                                if(!top_candidates.empty()) {
+                                    lowerBound = top_candidates.top().first;
+                                }
+                            }
                         }
-                        continue;
                     }
+                } else {
+                    // --- Upper layer path: data is in-memory, no batching needed ---
+                    for(idhInt j = 0; j < size; j++) {
+                        idhInt candidate_id = *(datal + j);
+                        if(visited_array[candidate_id] == visited_array_tag) continue;
+                        visited_array[candidate_id] = visited_array_tag;
+                        if(has_deletions && isMarkedDeleted(candidate_id)) continue;
 
-                    sim = curSimFunc(data_point, neighbor_data, curDistParam);
-                    dist_computations++; // Count valid computations too
+                        const void* neighbor_data = getUpperLayerDataPtr(candidate_id);
+                        if(!neighbor_data) continue;
 
-                    if(top_candidates.size() < ef || sim > lowerBound) {
-                        candidate_set.emplace(sim, candidate_id);
+                        bool pass_filter = true;
+                        if constexpr(!std::is_same_v<FilterFunctor, void>) {
+                            if (filter != nullptr) {
+                                if (!(*filter)(getExternalLabel(candidate_id))) {
+                                    pass_filter = false;
+                                }
+                            }
+                        }
 
-                        if(!has_deletions || !isMarkedDeleted(candidate_id)) {
-                             top_candidates.emplace(sim, candidate_id);
-                             if(top_candidates.size() > ef) {
-                                 top_candidates.pop();
-                             }
-                             if(!top_candidates.empty()) {
-                                 lowerBound = top_candidates.top().first;
-                             }
+                        dist_t sim;
+                        if(!pass_filter) {
+                            if (dist_computations > fatigue_base) {
+                                size_t excess = dist_computations - fatigue_base;
+                                if (excess >= fatigue_tail) continue;
+                                size_t drop_prob = (excess * 255) / fatigue_tail;
+                                size_t hash = (candidate_id * 104729) & 0xFF;
+                                if (hash < drop_prob) continue;
+                            }
+                            sim = curSimFunc(data_point, neighbor_data, curDistParam);
+                            dist_computations++;
+                            if (top_candidates.size() < ef || sim > lowerBound) {
+                                candidate_set.emplace(sim, candidate_id);
+                            }
+                            continue;
+                        }
+
+                        sim = curSimFunc(data_point, neighbor_data, curDistParam);
+                        dist_computations++;
+
+                        if(top_candidates.size() < ef || sim > lowerBound) {
+                            candidate_set.emplace(sim, candidate_id);
+                            if(!has_deletions || !isMarkedDeleted(candidate_id)) {
+                                top_candidates.emplace(sim, candidate_id);
+                                if(top_candidates.size() > ef) {
+                                    top_candidates.pop();
+                                }
+                                if(!top_candidates.empty()) {
+                                    lowerBound = top_candidates.top().first;
+                                }
+                            }
                         }
                     }
                 }
