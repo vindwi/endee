@@ -602,7 +602,7 @@ namespace hnswlib {
             // TODO - Check this ..is it thread safe to comment this
 
             // Put the data in cache. Will speed up initial data load
-            if (curLevel == 0 && vector_cache_) {
+            if (vector_cache_) {
                 vector_cache_->insert(cur_c, static_cast<const uint8_t*>(datapoint));
             }
 
@@ -661,24 +661,26 @@ namespace hnswlib {
                         int size = getListCount((idhInt*)ll_cur);
                         idhInt* datal = (idhInt*)(ll_cur + 1);
 
-                        std::vector<uint8_t> curr_vec(data_size_upper_);
-                        if(!getDataByInternalId(currObj, level, curr_vec.data())) {
+                        const uint8_t* curr_data = getUpperLayerDataPtr(currObj);
+                        if(!curr_data) {
                             continue;
                         }
 
                         dist_t curr_sim = fstSimFuncUpper_(datapoint_upper.data(),
-                                                           curr_vec.data(),
+                                                           curr_data,
                                                            dist_func_param_upper_);
 
                         for(int i = 0; i < size; i++) {
                             idhInt candidate_id = datal[i];
                             dist_t s;
-                            std::vector<uint8_t> candidate_vec(data_size_upper_);
-                            if(!getDataByInternalId(candidate_id, level, candidate_vec.data())) {
+                            
+                            const uint8_t* candidate_data = getUpperLayerDataPtr(candidate_id);
+                            if(!candidate_data) {
                                 continue;
                             }
+                            
                             s = fstSimFuncUpper_(datapoint_upper.data(),
-                                                 candidate_vec.data(),
+                                                 candidate_data,
                                                  dist_func_param_upper_);
 
                             if(s > curr_sim) {
@@ -965,7 +967,12 @@ namespace hnswlib {
             size_t curDataSize = (level == 0) ? data_size_ : data_size_upper_;
 
             std::vector<uint8_t> cand_buf(curDataSize);      // Only used for level 0
-            std::vector<uint8_t> selected_buf(curDataSize);  // Only used for level 0
+            // Cache selected vectors to avoid redundant re-fetches in inner loop
+            // Without this, each selected vector is re-fetched O(candidates) times → O(M²) fetches
+            std::vector<std::vector<uint8_t>> selected_vecs_cache;  // Only used for level 0
+            if(level == 0) {
+                selected_vecs_cache.reserve(curM);
+            }
 
             for(const auto& candidate : candidates_sorted) {
                 if(result.size() == curM) {
@@ -987,14 +994,12 @@ namespace hnswlib {
 
                 bool good = true;
                 dist_t sim;
-                for(const auto& selected : result) {
+                for(size_t si = 0; si < result.size(); si++) {
                     const void* selected_vec_ptr = nullptr;
                     if(level == 0) {
-                        if(getDataByInternalId(selected.second, level, selected_buf.data())) {
-                            selected_vec_ptr = selected_buf.data();
-                        }
+                        selected_vec_ptr = selected_vecs_cache[si].data();
                     } else {
-                        selected_vec_ptr = getUpperLayerDataPtr(selected.second);
+                        selected_vec_ptr = getUpperLayerDataPtr(result[si].second);
                     }
 
                     if(!selected_vec_ptr) {
@@ -1011,6 +1016,12 @@ namespace hnswlib {
 
                 if(good) {
                     result.push_back(candidate);
+                    // Cache the vector data so inner loop never re-fetches it
+                    if(level == 0) {
+                        selected_vecs_cache.emplace_back(
+                            static_cast<const uint8_t*>(cand_vec),
+                            static_cast<const uint8_t*>(cand_vec) + curDataSize);
+                    }
                 } else {
                     fill_back_ids.push_back(candidate);
                 }
