@@ -643,14 +643,62 @@ namespace ndd {
                 return HammingSim(v1, v2, params);
             }
 
+            inline constexpr size_t kBatchTileWordsBinary =
+#if defined(USE_AVX512)
+                    256;
+#elif defined(USE_AVX2)
+                    128;
+#elif defined(USE_SVE2)
+                    128;
+#elif defined(USE_NEON)
+                    64;
+#else
+                    32;
+#endif
+
+            inline void SimilarityBatchTiled(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out) {
+                if(count == 0) {
+                    return;
+                }
+
+                const size_t dim = *static_cast<const size_t*>(params);
+                const size_t num_words = (dim + 63) / 64;
+                const auto* q_words = static_cast<const uint64_t*>(query);
+
+                std::vector<float> dist_acc(count, 0.0f);
+                const size_t tile_words = std::min(num_words, kBatchTileWordsBinary);
+
+                for(size_t block_start = 0; block_start < num_words; block_start += tile_words) {
+                    const size_t block_len = std::min(tile_words, num_words - block_start);
+
+                    for(size_t i = 0; i < count; ++i) {
+                        const auto* v_words = static_cast<const uint64_t*>(vectors[i]);
+                        float dist = dist_acc[i];
+
+                        for(size_t w = 0; w < block_len; ++w) {
+                            dist += __builtin_popcountll(
+                                    q_words[block_start + w] ^ v_words[block_start + w]);
+                        }
+
+                        dist_acc[i] = dist;
+                    }
+                }
+
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = static_cast<float>(dim) - dist_acc[i];
+                }
+            }
+
             inline void L2SqrSimBatch(const void* query,
                                       const void* const* vectors,
                                       size_t count,
                                       const void* params,
                                       float* out) {
-                for(size_t i = 0; i < count; ++i) {
-                    out[i] = L2SqrSim(query, vectors[i], params);
-                }
+                SimilarityBatchTiled(query, vectors, count, params, out);
             }
 
             inline void InnerProductSimBatch(const void* query,
@@ -658,9 +706,7 @@ namespace ndd {
                                              size_t count,
                                              const void* params,
                                              float* out) {
-                for(size_t i = 0; i < count; ++i) {
-                    out[i] = InnerProductSim(query, vectors[i], params);
-                }
+                SimilarityBatchTiled(query, vectors, count, params, out);
             }
 
             inline void CosineSimBatch(const void* query,
@@ -668,9 +714,7 @@ namespace ndd {
                                        size_t count,
                                        const void* params,
                                        float* out) {
-                for(size_t i = 0; i < count; ++i) {
-                    out[i] = CosineSim(query, vectors[i], params);
-                }
+                SimilarityBatchTiled(query, vectors, count, params, out);
             }
 
             static std::vector<uint8_t> quantize_to_int8(const void* in, size_t dim) {

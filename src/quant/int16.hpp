@@ -1088,25 +1088,42 @@ namespace ndd {
 
                         size_t d = 0;
 #if defined(USE_AVX512)
-                        __m512i dot_vec = _mm512_setzero_si512();
-                        __m512i sq_vec = _mm512_setzero_si512();
-                        for(; d + 16 <= block_len; d += 16) {
-                            __m256i q_i16 = _mm256_loadu_si256(
-                                    reinterpret_cast<const __m256i*>(query_vec + block_start + d));
-                            __m256i v_i16 = _mm256_loadu_si256(
-                                    reinterpret_cast<const __m256i*>(vec + block_start + d));
+            __m512i dot_vec_lo = _mm512_setzero_si512();
+            __m512i dot_vec_hi = _mm512_setzero_si512();
+            __m512i sq_vec_lo = _mm512_setzero_si512();
+            __m512i sq_vec_hi = _mm512_setzero_si512();
 
-                            __m512i q_i32 = _mm512_cvtepi16_epi32(q_i16);
-                            __m512i v_i32 = _mm512_cvtepi16_epi32(v_i16);
-                            dot_vec = _mm512_add_epi32(dot_vec, _mm512_mullo_epi32(q_i32, v_i32));
-                            if(l2_metric) {
-                                sq_vec = _mm512_add_epi32(sq_vec, _mm512_mullo_epi32(v_i32, v_i32));
-                            }
-                        }
-                        dot += static_cast<int64_t>(_mm512_reduce_add_epi32(dot_vec));
-                        if(l2_metric) {
-                            vec_sq += static_cast<int64_t>(_mm512_reduce_add_epi32(sq_vec));
-                        }
+            for(; d + 32 <= block_len; d += 32) {
+                __m512i q_i16 = _mm512_loadu_si512(
+                    reinterpret_cast<const __m512i*>(query_vec + block_start + d));
+                __m512i v_i16 = _mm512_loadu_si512(
+                    reinterpret_cast<const __m512i*>(vec + block_start + d));
+
+                __m512i dot_i32 = _mm512_dpwssd_epi32(_mm512_setzero_si512(), q_i16, v_i16);
+                __m512i dot_i64_lo = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(dot_i32));
+                __m512i dot_i64_hi =
+                    _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(dot_i32, 1));
+                dot_vec_lo = _mm512_add_epi64(dot_vec_lo, dot_i64_lo);
+                dot_vec_hi = _mm512_add_epi64(dot_vec_hi, dot_i64_hi);
+
+                if(l2_metric) {
+                __m512i sq_i32 =
+                    _mm512_dpwssd_epi32(_mm512_setzero_si512(), v_i16, v_i16);
+                __m512i sq_i64_lo =
+                    _mm512_cvtepi32_epi64(_mm512_castsi512_si256(sq_i32));
+                __m512i sq_i64_hi =
+                    _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(sq_i32, 1));
+                sq_vec_lo = _mm512_add_epi64(sq_vec_lo, sq_i64_lo);
+                sq_vec_hi = _mm512_add_epi64(sq_vec_hi, sq_i64_hi);
+                }
+            }
+
+            dot += _mm512_reduce_add_epi64(dot_vec_lo)
+                   + _mm512_reduce_add_epi64(dot_vec_hi);
+            if(l2_metric) {
+                vec_sq += _mm512_reduce_add_epi64(sq_vec_lo)
+                      + _mm512_reduce_add_epi64(sq_vec_hi);
+            }
 #elif defined(USE_AVX2)
                         __m256i dot_vec = _mm256_setzero_si256();
                         __m256i sq_vec = _mm256_setzero_si256();
