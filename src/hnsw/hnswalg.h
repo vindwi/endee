@@ -48,6 +48,11 @@ namespace hnswlib {
         // Args: labels array, output buffers (flat, count*vector_size), success flags, count
         // Returns: number of successful fetches
         using VectorFetcherBatch = std::function<size_t(const idInt*, uint8_t*, bool*, size_t)>;
+        using SimBatchFunc = void (*)(const void* query,
+                          const void* const* vectors,
+                          size_t count,
+                          const void* params,
+                          float* out);
 
     public:
         // Constructors and destructor
@@ -256,7 +261,7 @@ namespace hnswlib {
             }
 
             dist_t s;
-            // Upper layer traversal - greedy search (including level 1)
+            // Upper layer traversal - greedy search (levels maxLevel_ down to 1)
             for(levelInt level = maxLevel_; level > 0; level--) {
                 bool changed = true;
                 while(changed) {
@@ -271,6 +276,11 @@ namespace hnswlib {
                     int size = getListCount(ll_cur);
                     idhInt* data = (idhInt*)(ll_cur + 1);
 
+                    std::vector<idhInt> valid_candidates;
+                    valid_candidates.reserve(size);
+                    std::vector<const void*> candidate_ptrs;
+                    candidate_ptrs.reserve(size);
+
                     for(int i = 0; i < size; i++) {
                         idhInt candidate = data[i];
                         if(candidate >= curElementsCount_) {
@@ -281,12 +291,28 @@ namespace hnswlib {
                         if(!candidate_data) {
                             continue;
                         }
-                        s = fstSimFuncUpper_(
-                                query_data_upper.data(), candidate_data, dist_func_param_upper_);
 
+                        valid_candidates.push_back(candidate);
+                        candidate_ptrs.push_back(candidate_data);
+                    }
+
+                    if(valid_candidates.empty()) {
+                        continue;
+                    }
+
+                    std::vector<dist_t> sims;
+                    computeBatchSimilaritiesFromPtrs(query_data_upper.data(),
+                                                     candidate_ptrs,
+                                                     level,
+                                                     fstSimFuncUpper_,
+                                                     dist_func_param_upper_,
+                                                     sims);
+
+                    for(size_t i = 0; i < valid_candidates.size(); ++i) {
+                        s = sims[i];
                         if(s > curSim) {
                             curSim = s;
-                            currObj = candidate;
+                            currObj = valid_candidates[i];
                             changed = true;
                         }
                     }
@@ -295,21 +321,7 @@ namespace hnswlib {
 
             std::vector<idhInt> entry_points;
             if (maxLevel_ > 0) {
-                 // Level 1 now uses greedy only; keep single best entry point.
-                 entry_points.push_back(currObj);
-
-                 // Old narrow beam search on level 1 (kept for restore)
-                 // std::vector<idhInt> l1_eps = {currObj};
-                 // std::vector<std::pair<dist_t, idhInt>> l1_res;
-                 // if(deletedElementsCount_) {
-                 //     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
-                 // } else {
-                 //     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
-                 // }
-                 // 
-                 // for(size_t i = 0; i < std::min((size_t)2, l1_res.size()); ++i) {
-                 //     entry_points.push_back(l1_res[i].second);
-                 // }
+                entry_points.push_back(currObj);
             } else {
                 entry_points.push_back(entryPoint_);
             }
@@ -974,6 +986,77 @@ namespace hnswlib {
             }
         }
 
+        ndd::quant::QuantizationLevel getQuantLevelForLayer(levelInt layer) const {
+            if(layer == 0) {
+                return quant_level_;
+            }
+            if(quant_level_ == ndd::quant::QuantizationLevel::BINARY) {
+                return quant_level_;
+            }
+            return ndd::quant::QuantizationLevel::INT8;
+        }
+
+        SimBatchFunc resolveBatchSimFunc(levelInt layer) const {
+            ndd::quant::QuantizerDispatch dispatch;
+            try {
+                dispatch = ndd::quant::get_quantizer_dispatch(getQuantLevelForLayer(layer));
+            } catch(...) {
+                return nullptr;
+            }
+
+            switch(space_type_) {
+                case L2_SPACE:
+                    return dispatch.sim_l2_batch;
+                case IP_SPACE:
+                    return dispatch.sim_ip_batch;
+                case COSINE_SPACE:
+                    return dispatch.sim_cosine_batch;
+                default:
+                    return nullptr;
+            }
+        }
+
+        void computeBatchSimilaritiesFromPtrs(const void* query_data,
+                                              const std::vector<const void*>& vector_ptrs,
+                                              levelInt layer,
+                                              SIMFUNC<dist_t> fallback_sim_func,
+                                              void* dist_param,
+                                              std::vector<dist_t>& out_sims) const {
+            out_sims.clear();
+            if(vector_ptrs.empty()) {
+                return;
+            }
+
+            out_sims.resize(vector_ptrs.size());
+
+            SimBatchFunc batch_func = resolveBatchSimFunc(layer);
+            if(!batch_func) {
+                for(size_t i = 0; i < vector_ptrs.size(); ++i) {
+                    out_sims[i] = fallback_sim_func(query_data, vector_ptrs[i], dist_param);
+                }
+                return;
+            }
+
+            if constexpr(std::is_same_v<dist_t, float>) {
+                batch_func(query_data,
+                           vector_ptrs.data(),
+                           vector_ptrs.size(),
+                           dist_param,
+                           out_sims.data());
+            } else {
+                std::vector<float> sim_out(vector_ptrs.size());
+                batch_func(query_data,
+                           vector_ptrs.data(),
+                           vector_ptrs.size(),
+                           dist_param,
+                           sim_out.data());
+
+                for(size_t i = 0; i < sim_out.size(); ++i) {
+                    out_sims[i] = static_cast<dist_t>(sim_out[i]);
+                }
+            }
+        }
+
         char* get_linklist0(idhInt internal_id) const {
             return dataBaseLayer_ + internal_id * sizeDataAtBaseLayer_;
         }
@@ -1381,42 +1464,58 @@ namespace hnswlib {
                                              batch_success.get(), valid_ids.size());
 
                     // Phase 3: Process fetched vectors
+                    std::vector<idhInt> pass_filter_candidate_ids;
+                    pass_filter_candidate_ids.reserve(valid_ids.size());
+                    std::vector<const void*> pass_filter_ptrs;
+                    pass_filter_ptrs.reserve(valid_ids.size());
+
                     for(size_t vi = 0; vi < valid_ids.size(); vi++) {
                         if(!batch_success[vi]) continue;
 
                         idhInt candidate_id = valid_ids[vi];
                         const void* neighbor_data = batch_buffers.data() + vi * data_size_;
 
-                        // Check filter BEFORE computing distance
                         bool pass_filter = true;
                         if constexpr(!std::is_same_v<FilterFunctor, void>) {
-                            if (filter != nullptr) {
-                                if (!(*filter)(getExternalLabel(candidate_id))) {
+                            if(filter != nullptr) {
+                                if(!(*filter)(getExternalLabel(candidate_id))) {
                                     pass_filter = false;
                                 }
                             }
                         }
 
-                        dist_t sim;
                         if(!pass_filter) {
-                            // Check Fatigue
-                            if (dist_computations > fatigue_base) {
+                            if(dist_computations > fatigue_base) {
                                 size_t excess = dist_computations - fatigue_base;
-                                if (excess >= fatigue_tail) continue;
+                                if(excess >= fatigue_tail) continue;
                                 size_t drop_prob = (excess * 255) / fatigue_tail;
                                 size_t hash = (candidate_id * 104729) & 0xFF;
-                                if (hash < drop_prob) continue;
+                                if(hash < drop_prob) continue;
                             }
-                            // Explore
-                            sim = curSimFunc(data_point, neighbor_data, curDistParam);
+
+                            dist_t sim = curSimFunc(data_point, neighbor_data, curDistParam);
                             dist_computations++;
-                            if (top_candidates.size() < ef || sim > lowerBound) {
+                            if(top_candidates.size() < ef || sim > lowerBound) {
                                 candidate_set.emplace(sim, candidate_id);
                             }
                             continue;
                         }
 
-                        sim = curSimFunc(data_point, neighbor_data, curDistParam);
+                        pass_filter_candidate_ids.push_back(candidate_id);
+                        pass_filter_ptrs.push_back(neighbor_data);
+                    }
+
+                    std::vector<dist_t> pass_filter_sims;
+                    computeBatchSimilaritiesFromPtrs(data_point,
+                                             pass_filter_ptrs,
+                                             layer,
+                                             curSimFunc,
+                                             curDistParam,
+                                             pass_filter_sims);
+
+                    for(size_t pi = 0; pi < pass_filter_candidate_ids.size(); ++pi) {
+                        idhInt candidate_id = pass_filter_candidate_ids[pi];
+                        dist_t sim = pass_filter_sims[pi];
                         dist_computations++;
 
                         if(top_candidates.size() < ef || sim > lowerBound) {

@@ -643,6 +643,36 @@ namespace ndd {
                 return HammingSim(v1, v2, params);
             }
 
+            inline void L2SqrSimBatch(const void* query,
+                                      const void* const* vectors,
+                                      size_t count,
+                                      const void* params,
+                                      float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = L2SqrSim(query, vectors[i], params);
+                }
+            }
+
+            inline void InnerProductSimBatch(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = InnerProductSim(query, vectors[i], params);
+                }
+            }
+
+            inline void CosineSimBatch(const void* query,
+                                       const void* const* vectors,
+                                       size_t count,
+                                       const void* params,
+                                       float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = CosineSim(query, vectors[i], params);
+                }
+            }
+
             static std::vector<uint8_t> quantize_to_int8(const void* in, size_t dim) {
                 throw std::runtime_error("Binary to Int8 direct quantization not implemented");
             }
@@ -662,6 +692,9 @@ namespace ndd {
                 d.sim_l2 = &binary::L2SqrSim;
                 d.sim_ip = &binary::InnerProductSim;
                 d.sim_cosine = &binary::CosineSim;
+                d.sim_l2_batch = &binary::L2SqrSimBatch;
+                d.sim_ip_batch = &binary::InnerProductSimBatch;
+                d.sim_cosine_batch = &binary::CosineSimBatch;
                 d.quantize = &binary::quantize;
                 d.dequantize = &binary::dequantize;
                 d.quantize_to_int8 = &binary::quantize_to_int8;

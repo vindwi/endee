@@ -1034,6 +1034,206 @@ namespace ndd {
                 return 1.0f - CosineSim(pVect1v, pVect2v, qty_ptr);
             }
 
+            static constexpr size_t kBatchTileSizeInt16 =
+#if defined(USE_AVX512)
+                    512;
+#elif defined(USE_AVX2)
+                    256;
+#elif defined(USE_SVE2)
+                    256;
+#elif defined(USE_NEON)
+                    128;
+#else
+                    64;
+#endif
+
+            static void SimilarityBatchTiled(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out,
+                                             bool l2_metric) {
+                if(count == 0) {
+                    return;
+                }
+
+                const auto* dist_params = static_cast<const hnswlib::DistParams*>(params);
+                const size_t dim = dist_params->dim;
+                const auto* query_vec = static_cast<const int16_t*>(query);
+                const float query_scale = extract_scale(static_cast<const uint8_t*>(query), dim);
+
+                std::vector<int64_t> dot_acc(count, 0);
+                std::vector<int64_t> vec_sq_acc;
+                if(l2_metric) {
+                    vec_sq_acc.assign(count, 0);
+                }
+
+                int64_t query_sq_acc = 0;
+                const size_t tile = std::min(dim, kBatchTileSizeInt16);
+                std::vector<int32_t> query_tile(tile, 0);
+
+                for(size_t block_start = 0; block_start < dim; block_start += tile) {
+                    const size_t block_len = std::min(tile, dim - block_start);
+
+                    for(size_t d = 0; d < block_len; ++d) {
+                        int32_t qv = static_cast<int32_t>(query_vec[block_start + d]);
+                        query_tile[d] = qv;
+                        query_sq_acc += static_cast<int64_t>(qv) * qv;
+                    }
+
+                    for(size_t i = 0; i < count; ++i) {
+                        const auto* vec = static_cast<const int16_t*>(vectors[i]);
+                        int64_t dot = dot_acc[i];
+                        int64_t vec_sq = l2_metric ? vec_sq_acc[i] : 0;
+
+                        size_t d = 0;
+#if defined(USE_AVX512)
+                        __m512i dot_vec = _mm512_setzero_si512();
+                        __m512i sq_vec = _mm512_setzero_si512();
+                        for(; d + 16 <= block_len; d += 16) {
+                            __m256i q_i16 = _mm256_loadu_si256(
+                                    reinterpret_cast<const __m256i*>(query_vec + block_start + d));
+                            __m256i v_i16 = _mm256_loadu_si256(
+                                    reinterpret_cast<const __m256i*>(vec + block_start + d));
+
+                            __m512i q_i32 = _mm512_cvtepi16_epi32(q_i16);
+                            __m512i v_i32 = _mm512_cvtepi16_epi32(v_i16);
+                            dot_vec = _mm512_add_epi32(dot_vec, _mm512_mullo_epi32(q_i32, v_i32));
+                            if(l2_metric) {
+                                sq_vec = _mm512_add_epi32(sq_vec, _mm512_mullo_epi32(v_i32, v_i32));
+                            }
+                        }
+                        dot += static_cast<int64_t>(_mm512_reduce_add_epi32(dot_vec));
+                        if(l2_metric) {
+                            vec_sq += static_cast<int64_t>(_mm512_reduce_add_epi32(sq_vec));
+                        }
+#elif defined(USE_AVX2)
+                        __m256i dot_vec = _mm256_setzero_si256();
+                        __m256i sq_vec = _mm256_setzero_si256();
+                        for(; d + 8 <= block_len; d += 8) {
+                            __m128i q_i16 = _mm_loadu_si128(
+                                    reinterpret_cast<const __m128i*>(query_vec + block_start + d));
+                            __m128i v_i16 = _mm_loadu_si128(
+                                    reinterpret_cast<const __m128i*>(vec + block_start + d));
+
+                            __m256i q_i32 = _mm256_cvtepi16_epi32(q_i16);
+                            __m256i v_i32 = _mm256_cvtepi16_epi32(v_i16);
+                            dot_vec = _mm256_add_epi32(dot_vec, _mm256_mullo_epi32(q_i32, v_i32));
+                            if(l2_metric) {
+                                sq_vec = _mm256_add_epi32(sq_vec, _mm256_mullo_epi32(v_i32, v_i32));
+                            }
+                        }
+                        {
+                            __m128i d0 = _mm_add_epi32(_mm256_castsi256_si128(dot_vec),
+                                                       _mm256_extracti128_si256(dot_vec, 1));
+                            d0 = _mm_hadd_epi32(d0, d0);
+                            d0 = _mm_hadd_epi32(d0, d0);
+                            dot += static_cast<int64_t>(_mm_cvtsi128_si32(d0));
+                        }
+                        if(l2_metric) {
+                            __m128i s0 = _mm_add_epi32(_mm256_castsi256_si128(sq_vec),
+                                                       _mm256_extracti128_si256(sq_vec, 1));
+                            s0 = _mm_hadd_epi32(s0, s0);
+                            s0 = _mm_hadd_epi32(s0, s0);
+                            vec_sq += static_cast<int64_t>(_mm_cvtsi128_si32(s0));
+                        }
+#elif defined(USE_NEON)
+                        int64x2_t dot_vec = vdupq_n_s64(0);
+                        int64x2_t sq_vec = vdupq_n_s64(0);
+                        for(; d + 8 <= block_len; d += 8) {
+                            int16x8_t q_i16 = vld1q_s16(query_vec + block_start + d);
+                            int16x8_t v_i16 = vld1q_s16(vec + block_start + d);
+
+                            int32x4_t dot_lo = vmull_s16(vget_low_s16(q_i16), vget_low_s16(v_i16));
+                            int32x4_t dot_hi = vmull_s16(vget_high_s16(q_i16), vget_high_s16(v_i16));
+                            dot_vec = vpadalq_s32(dot_vec, dot_lo);
+                            dot_vec = vpadalq_s32(dot_vec, dot_hi);
+
+                            if(l2_metric) {
+                                int32x4_t sq_lo = vmull_s16(vget_low_s16(v_i16), vget_low_s16(v_i16));
+                                int32x4_t sq_hi = vmull_s16(vget_high_s16(v_i16), vget_high_s16(v_i16));
+                                sq_vec = vpadalq_s32(sq_vec, sq_lo);
+                                sq_vec = vpadalq_s32(sq_vec, sq_hi);
+                            }
+                        }
+                        dot += static_cast<int64_t>(vgetq_lane_s64(dot_vec, 0))
+                               + static_cast<int64_t>(vgetq_lane_s64(dot_vec, 1));
+                        if(l2_metric) {
+                            vec_sq += static_cast<int64_t>(vgetq_lane_s64(sq_vec, 0))
+                                      + static_cast<int64_t>(vgetq_lane_s64(sq_vec, 1));
+                        }
+#elif defined(USE_SVE2)
+                        const size_t vec_lanes = svcntw();
+                        for(; d + vec_lanes <= block_len; d += vec_lanes) {
+                            svbool_t pg = svwhilelt_b32(0, vec_lanes);
+                            svint32_t q_i32 = svld1sh_s32(pg, query_vec + block_start + d);
+                            svint32_t v_i32 = svld1sh_s32(pg, vec + block_start + d);
+                            svint32_t dot_prod = svmul_s32_x(pg, q_i32, v_i32);
+                            dot += static_cast<int64_t>(svaddv_s32(pg, dot_prod));
+                            if(l2_metric) {
+                                svint32_t sq_prod = svmul_s32_x(pg, v_i32, v_i32);
+                                vec_sq += static_cast<int64_t>(svaddv_s32(pg, sq_prod));
+                            }
+                        }
+#endif
+
+                        for(; d < block_len; ++d) {
+                            int32_t vv = static_cast<int32_t>(vec[block_start + d]);
+                            dot += static_cast<int64_t>(query_tile[d]) * vv;
+                            if(l2_metric) {
+                                vec_sq += static_cast<int64_t>(vv) * vv;
+                            }
+                        }
+
+                        dot_acc[i] = dot;
+                        if(l2_metric) {
+                            vec_sq_acc[i] = vec_sq;
+                        }
+                    }
+                }
+
+                const float query_scale_sq = query_scale * query_scale;
+                for(size_t i = 0; i < count; ++i) {
+                    const auto* vec_u8 = static_cast<const uint8_t*>(vectors[i]);
+                    const float vec_scale = extract_scale(vec_u8, dim);
+                    const float cross_scale = query_scale * vec_scale;
+
+                    if(l2_metric) {
+                        const float vec_scale_sq = vec_scale * vec_scale;
+                        const float l2 = static_cast<float>(query_sq_acc) * query_scale_sq
+                                         + static_cast<float>(vec_sq_acc[i]) * vec_scale_sq
+                                         - 2.0f * static_cast<float>(dot_acc[i]) * cross_scale;
+                        out[i] = -l2;
+                    } else {
+                        out[i] = static_cast<float>(dot_acc[i]) * cross_scale;
+                    }
+                }
+            }
+
+            static void L2SqrSimBatch(const void* query,
+                                      const void* const* vectors,
+                                      size_t count,
+                                      const void* params,
+                                      float* out) {
+                SimilarityBatchTiled(query, vectors, count, params, out, true);
+            }
+
+            static void InnerProductSimBatch(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out) {
+                SimilarityBatchTiled(query, vectors, count, params, out, false);
+            }
+
+            static void CosineSimBatch(const void* query,
+                                       const void* const* vectors,
+                                       size_t count,
+                                       const void* params,
+                                       float* out) {
+                SimilarityBatchTiled(query, vectors, count, params, out, false);
+            }
+
             // Direct Int16 -> Int8 quantization
             static std::vector<uint8_t> quantize_to_int8(const void* in, size_t dim) {
                 const int16_t* in_data = static_cast<const int16_t*>(in);
@@ -1105,6 +1305,9 @@ namespace ndd {
                 d.sim_l2 = &int16::L2SqrSim;
                 d.sim_ip = &int16::InnerProductSim;
                 d.sim_cosine = &int16::CosineSim;
+                d.sim_l2_batch = &int16::L2SqrSimBatch;
+                d.sim_ip_batch = &int16::InnerProductSimBatch;
+                d.sim_cosine_batch = &int16::CosineSimBatch;
                 d.quantize = &int16::quantize;
                 d.dequantize = &int16::dequantize;
                 d.quantize_to_int8 = &int16::quantize_to_int8;

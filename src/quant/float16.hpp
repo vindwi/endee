@@ -790,6 +790,36 @@ namespace ndd {
                 return 1.0f - CosineSim(pVect1v, pVect2v, qty_ptr);
             }
 
+            static void L2SqrSimBatch(const void* query,
+                                      const void* const* vectors,
+                                      size_t count,
+                                      const void* params,
+                                      float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = L2SqrSim(query, vectors[i], params);
+                }
+            }
+
+            static void InnerProductSimBatch(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = InnerProductSim(query, vectors[i], params);
+                }
+            }
+
+            static void CosineSimBatch(const void* query,
+                                       const void* const* vectors,
+                                       size_t count,
+                                       const void* params,
+                                       float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = CosineSim(query, vectors[i], params);
+                }
+            }
+
             static std::vector<uint8_t> quantize_to_int8(const void* in, size_t dim) {
                 const uint16_t* input = static_cast<const uint16_t*>(in);
                 // Calculate storage size: dim bytes for data + 4 bytes for scale
@@ -1079,6 +1109,9 @@ namespace ndd {
                 d.sim_l2 = &float16::L2SqrSim;
                 d.sim_ip = &float16::InnerProductSim;
                 d.sim_cosine = &float16::CosineSim;
+                d.sim_l2_batch = &float16::L2SqrSimBatch;
+                d.sim_ip_batch = &float16::InnerProductSimBatch;
+                d.sim_cosine_batch = &float16::CosineSimBatch;
                 d.quantize = &float16::quantize;
                 d.dequantize = &float16::dequantize;
                 d.quantize_to_int8 = &float16::quantize_to_int8;

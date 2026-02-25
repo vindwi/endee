@@ -465,6 +465,36 @@ namespace hnswlib {
                 return InnerProductSim(pVect1, pVect2, params_ptr);
             }
 
+            static void L2SqrSimBatch(const void* query,
+                                      const void* const* vectors,
+                                      size_t count,
+                                      const void* params,
+                                      float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = L2SqrSim(query, vectors[i], params);
+                }
+            }
+
+            static void InnerProductSimBatch(const void* query,
+                                             const void* const* vectors,
+                                             size_t count,
+                                             const void* params,
+                                             float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = InnerProductSim(query, vectors[i], params);
+                }
+            }
+
+            static void CosineSimBatch(const void* query,
+                                       const void* const* vectors,
+                                       size_t count,
+                                       const void* params,
+                                       float* out) {
+                for(size_t i = 0; i < count; ++i) {
+                    out[i] = CosineSim(query, vectors[i], params);
+                }
+            }
+
             static float
             InnerProductDistance(const void* pVect1, const void* pVect2, const void* params_ptr) {
                 const DistParams* params = reinterpret_cast<const DistParams*>(params_ptr);
@@ -551,6 +581,9 @@ namespace ndd {
                 d.sim_l2 = &hnswlib::quant::float32::L2SqrSim;
                 d.sim_ip = &hnswlib::quant::float32::InnerProductSim;
                 d.sim_cosine = &hnswlib::quant::float32::CosineSim;
+                d.sim_l2_batch = &hnswlib::quant::float32::L2SqrSimBatch;
+                d.sim_ip_batch = &hnswlib::quant::float32::InnerProductSimBatch;
+                d.sim_cosine_batch = &hnswlib::quant::float32::CosineSimBatch;
                 d.quantize = &hnswlib::quant::float32::quantize;
                 d.dequantize = &hnswlib::quant::float32::dequantize;
                 d.quantize_to_int8 = &hnswlib::quant::float32::quantize_to_int8;
