@@ -256,8 +256,8 @@ namespace hnswlib {
             }
 
             dist_t s;
-            // Upper layer traversal - greedy search
-            for(levelInt level = maxLevel_; level > 1; level--) {
+            // Upper layer traversal - greedy search (including level 1)
+            for(levelInt level = maxLevel_; level > 0; level--) {
                 bool changed = true;
                 while(changed) {
                     changed = false;
@@ -295,17 +295,21 @@ namespace hnswlib {
 
             std::vector<idhInt> entry_points;
             if (maxLevel_ > 0) {
-                 std::vector<idhInt> l1_eps = {currObj};
-                 std::vector<std::pair<dist_t, idhInt>> l1_res;
-                 if(deletedElementsCount_) {
-                     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
-                 } else {
-                     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
-                 }
-                 
-                 for(size_t i = 0; i < std::min((size_t)2, l1_res.size()); ++i) {
-                     entry_points.push_back(l1_res[i].second);
-                 }
+                 // Level 1 now uses greedy only; keep single best entry point.
+                 entry_points.push_back(currObj);
+
+                 // Old narrow beam search on level 1 (kept for restore)
+                 // std::vector<idhInt> l1_eps = {currObj};
+                 // std::vector<std::pair<dist_t, idhInt>> l1_res;
+                 // if(deletedElementsCount_) {
+                 //     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
+                 // } else {
+                 //     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, settings::DEFAULT_EF_SEARCH_L1, isIdAllowed, filter_boost_percentage);
+                 // }
+                 // 
+                 // for(size_t i = 0; i < std::min((size_t)2, l1_res.size()); ++i) {
+                 //     entry_points.push_back(l1_res[i].second);
+                 // }
             } else {
                 entry_points.push_back(entryPoint_);
             }
