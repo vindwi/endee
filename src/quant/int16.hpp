@@ -1127,8 +1127,10 @@ namespace ndd {
                                       + _mm512_reduce_add_epi64(sq_vec_hi);
                         }
 #elif defined(USE_AVX2)
-                        __m256i dot_vec = _mm256_setzero_si256();
-                        __m256i sq_vec = _mm256_setzero_si256();
+                        __m256i dot_vec_lo = _mm256_setzero_si256();
+                        __m256i dot_vec_hi = _mm256_setzero_si256();
+                        __m256i sq_vec_lo = _mm256_setzero_si256();
+                        __m256i sq_vec_hi = _mm256_setzero_si256();
                         for(; d + 8 <= block_len; d += 8) {
                             __m128i q_i16 = _mm_loadu_si128(
                                     reinterpret_cast<const __m128i*>(query_vec + block_start + d));
@@ -1137,24 +1139,41 @@ namespace ndd {
 
                             __m256i q_i32 = _mm256_cvtepi16_epi32(q_i16);
                             __m256i v_i32 = _mm256_cvtepi16_epi32(v_i16);
-                            dot_vec = _mm256_add_epi32(dot_vec, _mm256_mullo_epi32(q_i32, v_i32));
+                            __m256i dot_i32 = _mm256_mullo_epi32(q_i32, v_i32);
+                            __m256i dot_i64_lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(dot_i32));
+                            __m256i dot_i64_hi =
+                                    _mm256_cvtepi32_epi64(_mm256_extracti128_si256(dot_i32, 1));
+                            dot_vec_lo = _mm256_add_epi64(dot_vec_lo, dot_i64_lo);
+                            dot_vec_hi = _mm256_add_epi64(dot_vec_hi, dot_i64_hi);
                             if(l2_metric) {
-                                sq_vec = _mm256_add_epi32(sq_vec, _mm256_mullo_epi32(v_i32, v_i32));
+                                __m256i sq_i32 = _mm256_mullo_epi32(v_i32, v_i32);
+                                __m256i sq_i64_lo =
+                                        _mm256_cvtepi32_epi64(_mm256_castsi256_si128(sq_i32));
+                                __m256i sq_i64_hi =
+                                        _mm256_cvtepi32_epi64(_mm256_extracti128_si256(sq_i32, 1));
+                                sq_vec_lo = _mm256_add_epi64(sq_vec_lo, sq_i64_lo);
+                                sq_vec_hi = _mm256_add_epi64(sq_vec_hi, sq_i64_hi);
                             }
                         }
                         {
-                            __m128i d0 = _mm_add_epi32(_mm256_castsi256_si128(dot_vec),
-                                                       _mm256_extracti128_si256(dot_vec, 1));
-                            d0 = _mm_hadd_epi32(d0, d0);
-                            d0 = _mm_hadd_epi32(d0, d0);
-                            dot += static_cast<int64_t>(_mm_cvtsi128_si32(d0));
+                            __m128i d_lo = _mm_add_epi64(_mm256_castsi256_si128(dot_vec_lo),
+                                                         _mm256_extracti128_si256(dot_vec_lo, 1));
+                            __m128i d_hi = _mm_add_epi64(_mm256_castsi256_si128(dot_vec_hi),
+                                                         _mm256_extracti128_si256(dot_vec_hi, 1));
+                            d_lo = _mm_add_epi64(d_lo, d_hi);
+                            __m128i d_swap = _mm_unpackhi_epi64(d_lo, d_lo);
+                            d_lo = _mm_add_epi64(d_lo, d_swap);
+                            dot += static_cast<int64_t>(_mm_cvtsi128_si64(d_lo));
                         }
                         if(l2_metric) {
-                            __m128i s0 = _mm_add_epi32(_mm256_castsi256_si128(sq_vec),
-                                                       _mm256_extracti128_si256(sq_vec, 1));
-                            s0 = _mm_hadd_epi32(s0, s0);
-                            s0 = _mm_hadd_epi32(s0, s0);
-                            vec_sq += static_cast<int64_t>(_mm_cvtsi128_si32(s0));
+                            __m128i s_lo = _mm_add_epi64(_mm256_castsi256_si128(sq_vec_lo),
+                                                         _mm256_extracti128_si256(sq_vec_lo, 1));
+                            __m128i s_hi = _mm_add_epi64(_mm256_castsi256_si128(sq_vec_hi),
+                                                         _mm256_extracti128_si256(sq_vec_hi, 1));
+                            s_lo = _mm_add_epi64(s_lo, s_hi);
+                            __m128i s_swap = _mm_unpackhi_epi64(s_lo, s_lo);
+                            s_lo = _mm_add_epi64(s_lo, s_swap);
+                            vec_sq += static_cast<int64_t>(_mm_cvtsi128_si64(s_lo));
                         }
 #elif defined(USE_NEON)
                         int64x2_t dot_vec = vdupq_n_s64(0);
@@ -1188,10 +1207,16 @@ namespace ndd {
                             svint32_t q_i32 = svld1sh_s32(pg, query_vec + block_start + d);
                             svint32_t v_i32 = svld1sh_s32(pg, vec + block_start + d);
                             svint32_t dot_prod = svmul_s32_x(pg, q_i32, v_i32);
-                            dot += static_cast<int64_t>(svaddv_s32(pg, dot_prod));
+                            svint64_t dot_lo = svunpklo_s64(dot_prod);
+                            svint64_t dot_hi = svunpkhi_s64(dot_prod);
+                            dot += svaddv_s64(svptrue_b64(), dot_lo)
+                                   + svaddv_s64(svptrue_b64(), dot_hi);
                             if(l2_metric) {
                                 svint32_t sq_prod = svmul_s32_x(pg, v_i32, v_i32);
-                                vec_sq += static_cast<int64_t>(svaddv_s32(pg, sq_prod));
+                                svint64_t sq_lo = svunpklo_s64(sq_prod);
+                                svint64_t sq_hi = svunpkhi_s64(sq_prod);
+                                vec_sq += svaddv_s64(svptrue_b64(), sq_lo)
+                                          + svaddv_s64(svptrue_b64(), sq_hi);
                             }
                         }
 #endif
