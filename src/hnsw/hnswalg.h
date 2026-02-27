@@ -105,26 +105,7 @@ namespace hnswlib {
                 LOG_DEBUG("Vector cache allocated: " << cache_bytes << " bytes (" << (cache_bytes / MB) << " MB)");
             }
 
-            // Initialize upper layer space
-            bool use_hybrid = true;
-            if(quant_level_ == ndd::quant::QuantizationLevel::BINARY) {
-                use_hybrid = false;
-            }
-
-            if(use_hybrid) {
-                space_upper_ = std::unique_ptr<SpaceInterface<float>>(createSpace<float>(
-                        space_type_, dimension_, ndd::quant::QuantizationLevel::INT8));
-                LOG_DEBUG("Upper layer initialized with Hybrid Quantization (INT8)");
-            } else {
-                space_upper_ = std::unique_ptr<SpaceInterface<float>>(
-                        createSpace<float>(space_type_, dimension_, quant_level_));
-                LOG_DEBUG("Upper layer initialized with same space as base layer");
-            }
-
-            data_size_upper_ = space_upper_->get_data_size();
-            fstSimFuncUpper_ = space_upper_->get_sim_func();
-            dist_func_param_upper_ = space_upper_->get_dist_func_param();
-            LOG_DEBUG("Upper layer data size: " << data_size_upper_);
+            LOG_DEBUG("Unified layer data size: " << data_size_);
 
             // M_ cannot be more than settings::MAX_M
             if(M_ > settings::MAX_M) {
@@ -201,29 +182,15 @@ namespace hnswlib {
             // Approximate level > 0 count
             size_t upper_layer_estimate = maxElements_ / M_;
 
-            // Upper layer calculation using runtime data size
-            size += upper_layer_estimate
-                    * (data_size_upper_ + sizeof(levelInt) + sizeLinksUpperLayers_);
+                // Upper layer calculation using runtime data size
+                size += upper_layer_estimate
+                    * (data_size_ + sizeof(levelInt) + sizeLinksUpperLayers_);
 
             if (vector_cache_) {
                 size += vector_cache_->getMemoryUsage();
             }
 
             return size / GB;  // GB
-        }
-
-        // Helper to get data representation for upper layers
-        std::vector<uint8_t> getUpperLayerRepresentation(const void* datapoint) {
-            if(data_size_upper_ == data_size_) {
-                // If sizes match, just copy (No hybrid quantization or Same Space)
-                std::vector<uint8_t> res(data_size_);
-                memcpy(res.data(), datapoint, data_size_);
-                return res;
-            }
-
-            // Hybrid quantization enabled (INT8)
-            auto dispatch = ndd::quant::get_quantizer_dispatch(quant_level_);
-            return dispatch.quantize_to_int8(datapoint, dimension_);
         }
 
         // Cache management getters/setters
@@ -236,7 +203,6 @@ namespace hnswlib {
                   size_t ef,
                   FilterFunctor* isIdAllowed,
                   size_t filter_boost_percentage = settings::FILTER_BOOST_PERCENTAGE) const { // Default true as requested
-            int x = 0;
             LOG_DEBUG("Inside searchKnn, element count: " << curElementsCount_);
             std::vector<std::pair<dist_t, idInt>> result;
             if(curElementsCount_ == 0) {
@@ -246,20 +212,14 @@ namespace hnswlib {
             idhInt currObj = entryPoint_;
             dist_t curSim;
 
-            // Prepare query data for upper layers
-            std::vector<uint8_t> query_data_upper;
             if(maxLevel_ > 0) {
-                query_data_upper =
-                        const_cast<HierarchicalNSW*>(this)->getUpperLayerRepresentation(query_data);
-
                 // Use direct pointer for upper layers
                 const uint8_t* ep_data = getUpperLayerDataPtr(currObj);
                 if(!ep_data) {
                     return result;
                 }
 
-                curSim = fstSimFuncUpper_(
-                        query_data_upper.data(), ep_data, dist_func_param_upper_);
+                curSim = fstSimFunc_(query_data, ep_data, dist_func_param_);
             }
 
             dist_t s;
@@ -303,11 +263,10 @@ namespace hnswlib {
                     }
 
                     std::vector<dist_t> sims;
-                    computeBatchSimilaritiesFromPtrs(query_data_upper.data(),
+                    computeBatchSimilaritiesFromPtrs(query_data,
                                                      candidate_ptrs,
-                                                     level,
-                                                     fstSimFuncUpper_,
-                                                     dist_func_param_upper_,
+                                                     fstSimFunc_,
+                                                     dist_func_param_,
                                                      sims);
 
                     for(size_t i = 0; i < valid_candidates.size(); ++i) {
@@ -403,9 +362,8 @@ namespace hnswlib {
                     continue;
                 }
 
-                // Use data_size_upper_
-                level = *reinterpret_cast<levelInt*>(dataUpperLayer_[i].get() + data_size_upper_);
-                total_size = data_size_upper_ + sizeof(levelInt) + level * sizeLinksUpperLayers_;
+                level = *reinterpret_cast<levelInt*>(dataUpperLayer_[i].get() + data_size_);
+                total_size = data_size_ + sizeof(levelInt) + level * sizeLinksUpperLayers_;
 
                 writeBinaryPOD(output, static_cast<idhInt>(i));  // write ID
                 output.write(reinterpret_cast<char*>(dataUpperLayer_[i].get()),
@@ -472,20 +430,6 @@ namespace hnswlib {
             fstSimFunc_ = space_->get_sim_func();
             dist_func_param_ = space_->get_dist_func_param();
 
-            // Initialize upper layer space
-            bool use_hybrid = true;
-            if(quant_level_ == ndd::quant::QuantizationLevel::BINARY) {
-                use_hybrid = false;
-            }
-
-            if(use_hybrid) {
-                space_upper_ = std::unique_ptr<SpaceInterface<float>>(createSpace<float>(
-                        space_type_, dimension_, ndd::quant::QuantizationLevel::INT8));
-            } else {
-                space_upper_ = std::unique_ptr<SpaceInterface<float>>(
-                        createSpace<float>(space_type_, dimension_, quant_level_));
-            }
-
             // Initialize cache for loaded index
             size_t cache_bits = VectorCache::calculateCacheBits(maxElements_);
             LOG_INFO("Calculated cache bits for loaded index: " << cache_bits);
@@ -493,10 +437,6 @@ namespace hnswlib {
                  vector_cache_ = std::make_unique<VectorCache>(data_size_, cache_bits);
                  LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1ULL << cache_bits) << " slots");
             }
-
-              data_size_upper_ = space_upper_->get_data_size();
-            fstSimFuncUpper_ = space_upper_->get_sim_func();
-            dist_func_param_upper_ = space_upper_->get_dist_func_param();
 
             // Allocate memory and load level 0 data
             dataBaseLayer_ = (char*)malloc(maxElements_ * sizeDataAtBaseLayer_);
@@ -539,7 +479,7 @@ namespace hnswlib {
 
                 size_t header_size;
                 // Step 1: Read vector + level header
-                header_size = data_size_upper_ + sizeof(levelInt);
+                header_size = data_size_ + sizeof(levelInt);
 
                 std::vector<uint8_t> header_buf(header_size);
                 input.read(reinterpret_cast<char*>(header_buf.data()), header_size);
@@ -548,7 +488,7 @@ namespace hnswlib {
                 }
 
                 levelInt level;
-                level = *reinterpret_cast<levelInt*>(header_buf.data() + data_size_upper_);
+                level = *reinterpret_cast<levelInt*>(header_buf.data() + data_size_);
 
                 size_t total_size = header_size + level * sizeLinksUpperLayers_;
 
@@ -586,9 +526,6 @@ namespace hnswlib {
 
         template <bool is_new> void addPoint(const void* datapoint, idInt label) {
             LOG_TIME("addPoint");
-
-            // Generate upper layer representation
-            std::vector<uint8_t> datapoint_upper = getUpperLayerRepresentation(datapoint);
 
             //std::shared_lock<std::shared_mutex> lock(index_lock_);
             idhInt cur_c = 0;
@@ -652,15 +589,15 @@ namespace hnswlib {
             size_t total_size;
             if(curLevel > 0) {
 
-                total_size = data_size_upper_ + sizeof(levelInt) + curLevel * sizeLinksUpperLayers_;
+                total_size = data_size_ + sizeof(levelInt) + curLevel * sizeLinksUpperLayers_;
 
                 auto mem = std::make_unique<uint8_t[]>(total_size);
 
-                // copy vector
-                memcpy(mem.get(), datapoint_upper.data(), data_size_upper_);
-                memcpy(mem.get() + data_size_upper_, &curLevel, sizeof(levelInt));
+                                // copy vector
+                                memcpy(mem.get(), datapoint, data_size_);
+                                memcpy(mem.get() + data_size_, &curLevel, sizeof(levelInt));
                 // zero initialize linklists
-                memset(mem.get() + data_size_upper_ + sizeof(levelInt),
+                                memset(mem.get() + data_size_ + sizeof(levelInt),
                        0,
                        curLevel * sizeLinksUpperLayers_);
 
@@ -694,9 +631,7 @@ namespace hnswlib {
                             continue;
                         }
 
-                        dist_t curr_sim = fstSimFuncUpper_(datapoint_upper.data(),
-                                                           curr_data,
-                                                           dist_func_param_upper_);
+                        dist_t curr_sim = fstSimFunc_(datapoint, curr_data, dist_func_param_);
 
                         for(int i = 0; i < size; i++) {
                             idhInt candidate_id = datal[i];
@@ -707,9 +642,7 @@ namespace hnswlib {
                                 continue;
                             }
                             
-                            s = fstSimFuncUpper_(datapoint_upper.data(),
-                                                 candidate_data,
-                                                 dist_func_param_upper_);
+                            s = fstSimFunc_(datapoint, candidate_data, dist_func_param_);
 
                             if(s > curr_sim) {
                                 curr_sim = s;
@@ -724,7 +657,7 @@ namespace hnswlib {
                 for(int level = std::min(curLevel, maxlevelcopy); level >= 0; level--) {
                     std::vector<std::pair<dist_t, idhInt>> sorted_candidates;
                     
-                    const void* level_datapoint = (level == 0) ? datapoint : datapoint_upper.data();
+                    const void* level_datapoint = datapoint;
                     
                     std::vector<idhInt> cur_eps = {currObj};
                     if(deletedElementsCount_) {
@@ -806,8 +739,6 @@ namespace hnswlib {
         uint64_t flags_{0};  //Not using flags now. We can use it in future for various options
         std::unique_ptr<SpaceInterface<dist_t>> space_;
 
-        std::unique_ptr<SpaceInterface<dist_t>> space_upper_;
-
         size_t dimension_;
 
         VectorFetcher vector_fetcher_;
@@ -847,11 +778,6 @@ namespace hnswlib {
         DISTFUNC<dist_t> fstDistFunc_;
         SIMFUNC<dist_t> fstSimFunc_;
         void* dist_func_param_{nullptr};
-
-        // Unified upper layer data parameters
-        size_t data_size_upper_{0};
-        SIMFUNC<dist_t> fstSimFuncUpper_;
-        void* dist_func_param_upper_{nullptr};
 
         // Cache for vectors
         mutable std::unique_ptr<VectorCache> vector_cache_;
@@ -924,6 +850,7 @@ namespace hnswlib {
         }
 
         // Modified function returning bool and filling buffer.
+        // For upper-layer vectors, data is returned zero-copy via cache_read_handle only.
         // For layer 0, callers can optionally receive zero-copy cache hits via cache_read_handle.
         bool getDataByInternalId(idhInt internal_id,
                                  levelInt layer,
@@ -931,6 +858,15 @@ namespace hnswlib {
                                  CacheReadView* cache_read_handle = nullptr) const {
             if(cache_read_handle) {
                 *cache_read_handle = CacheReadView();
+            }
+
+            const uint8_t* upper_ptr = getUpperLayerDataPtr(internal_id);
+            if(upper_ptr) {
+                if(cache_read_handle) {
+                    cache_read_handle->data = upper_ptr;
+                    return true;
+                }
+                return false;
             }
 
             if(layer == 0) {
@@ -973,24 +909,21 @@ namespace hnswlib {
                     return success;
                 }
                 return false;
-            } else {
-                // FALLBACK: ideally callers should use getUpperLayerDataPtr
-                if(dataUpperLayer_[internal_id] == nullptr) {
-                    return false;
-                }
-                memcpy(buffer, dataUpperLayer_[internal_id].get(), data_size_upper_);
-                return true;
             }
+
+            // layer > 0 path with no upper-layer blob available
             return false;
         }
 
-        // Batch fetch for level 0: check cache first, then fetch all misses in one MDBX txn.
+        // Batch fetch for level 0: check upper-layer data/cache first, then fetch misses in one MDBX txn.
         // internal_ids: array of internal IDs to fetch
         // buffers: flat output buffer, count * data_size_ bytes
         // success: output array of bools
         // count: number of IDs
+        // data_ptrs: optional per-item pointers to fetched data (zero-copy for upper-layer)
         void getDataByInternalIdBatch(const idhInt* internal_ids, uint8_t* buffers,
-                                       bool* success, size_t count) const {
+                                       bool* success, size_t count,
+                                       const void** data_ptrs = nullptr) const {
             // Phase 1: Check cache for all IDs, collect misses
             std::vector<size_t> miss_indices;      // index into the batch
             std::vector<idInt> miss_labels;         // external labels for MDBX lookup
@@ -999,11 +932,29 @@ namespace hnswlib {
 
             for(size_t i = 0; i < count; i++) {
                 uint8_t* buf = buffers + i * data_size_;
+                if(data_ptrs) {
+                    data_ptrs[i] = nullptr;
+                }
+
+                const uint8_t* upper_ptr = getUpperLayerDataPtr(internal_ids[i]);
+                if(upper_ptr) {
+                    if(data_ptrs) {
+                        data_ptrs[i] = upper_ptr;
+                    } else {
+                        std::memcpy(buf, upper_ptr, data_size_);
+                    }
+                    success[i] = true;
+                    continue;
+                }
+
                 if(vector_cache_) {
                     std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_ids[i]));
                     const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_ids[i]);
                     if(cached_ptr) {
                         std::memcpy(buf, cached_ptr, data_size_);
+                        if(data_ptrs) {
+                            data_ptrs[i] = buf;
+                        }
                         success[i] = true;
                         continue;
                     }
@@ -1030,6 +981,9 @@ namespace hnswlib {
                     if(miss_success[mi]) {
                         uint8_t* buf = buffers + i * data_size_;
                         std::memcpy(buf, miss_buffers.data() + mi * data_size_, data_size_);
+                        if(data_ptrs) {
+                            data_ptrs[i] = buf;
+                        }
                         success[i] = true;
                         // Populate cache
                         if(vector_cache_) {
@@ -1048,6 +1002,9 @@ namespace hnswlib {
                     uint8_t* buf = buffers + i * data_size_;
                     bool ok = vector_fetcher_(miss_labels[mi], buf);
                     success[i] = ok;
+                    if(ok && data_ptrs) {
+                        data_ptrs[i] = buf;
+                    }
                     if(ok && vector_cache_) {
                         std::unique_lock<std::shared_timed_mutex> write_lock(
                                 getCacheMutex(internal_ids[i]), std::try_to_lock);
@@ -1059,20 +1016,10 @@ namespace hnswlib {
             }
         }
 
-        ndd::quant::QuantizationLevel getQuantLevelForLayer(levelInt layer) const {
-            if(layer == 0) {
-                return quant_level_;
-            }
-            if(quant_level_ == ndd::quant::QuantizationLevel::BINARY) {
-                return quant_level_;
-            }
-            return ndd::quant::QuantizationLevel::INT8;
-        }
-
-        SimBatchFunc resolveBatchSimFunc(levelInt layer) const {
+        SimBatchFunc resolveBatchSimFunc() const {
             ndd::quant::QuantizerDispatch dispatch;
             try {
-                dispatch = ndd::quant::get_quantizer_dispatch(getQuantLevelForLayer(layer));
+                dispatch = ndd::quant::get_quantizer_dispatch(quant_level_);
             } catch(...) {
                 return nullptr;
             }
@@ -1091,7 +1038,6 @@ namespace hnswlib {
 
         void computeBatchSimilaritiesFromPtrs(const void* query_data,
                                               const std::vector<const void*>& vector_ptrs,
-                                              levelInt layer,
                                               SIMFUNC<dist_t> fallback_sim_func,
                                               void* dist_param,
                                               std::vector<dist_t>& out_sims) const {
@@ -1102,7 +1048,7 @@ namespace hnswlib {
 
             out_sims.resize(vector_ptrs.size());
 
-            SimBatchFunc batch_func = resolveBatchSimFunc(layer);
+            SimBatchFunc batch_func = resolveBatchSimFunc();
             if(!batch_func) {
                 for(size_t i = 0; i < vector_ptrs.size(); ++i) {
                     out_sims[i] = fallback_sim_func(query_data, vector_ptrs[i], dist_param);
@@ -1141,7 +1087,7 @@ namespace hnswlib {
             // int levels = getElementLevel(id);
             // if (level > levels) return nullptr;
             return reinterpret_cast<char*>(
-                    dataUpperLayer_[id].get() + data_size_upper_ + sizeof(levelInt)
+                    dataUpperLayer_[id].get() + data_size_ + sizeof(levelInt)
                     + (level - 1) * sizeLinksUpperLayers_
 
             );
@@ -1168,7 +1114,7 @@ namespace hnswlib {
             if(!dataUpperLayer_[id]) {
                 return 0;
             }
-            return *reinterpret_cast<const levelInt*>(dataUpperLayer_[id].get() + data_size_upper_);
+            return *reinterpret_cast<const levelInt*>(dataUpperLayer_[id].get() + data_size_);
         }
 
         // This function is used to get the neighbors based on heuristic
@@ -1189,9 +1135,9 @@ namespace hnswlib {
             fill_back_ids.reserve(candidates_sorted.size() - curM);
 
             // Generic awareness
-            auto curSimFunc = (level == 0) ? fstSimFunc_ : fstSimFuncUpper_;
-            auto curDistParam = (level == 0) ? dist_func_param_ : dist_func_param_upper_;
-            size_t curDataSize = (level == 0) ? data_size_ : data_size_upper_;
+            auto curSimFunc = fstSimFunc_;
+            auto curDistParam = dist_func_param_;
+            size_t curDataSize = data_size_;
 
             std::vector<uint8_t> cand_buf(curDataSize);      // Only used for level 0
             // Cache selected vectors to avoid redundant re-fetches in inner loop
@@ -1289,9 +1235,9 @@ namespace hnswlib {
             size_t curM = level ? M_ : M0_;
 
             // Generic awareness
-            auto curSimFunc = (level == 0) ? fstSimFunc_ : fstSimFuncUpper_;
-            auto curDistParam = (level == 0) ? dist_func_param_ : dist_func_param_upper_;
-            size_t curDataSize = (level == 0) ? data_size_ : data_size_upper_;
+            auto curSimFunc = fstSimFunc_;
+            auto curDistParam = dist_func_param_;
+            size_t curDataSize = data_size_;
 
             auto selected = getNeighborsByHeuristic2(sorted_candidates, curM, level);
             if(selected.empty()) {  // the graph is empty or disconnected
@@ -1420,9 +1366,9 @@ namespace hnswlib {
             min_heap_pq top_candidates;
 
             // Generic awareness
-            auto curSimFunc = (layer == 0) ? fstSimFunc_ : fstSimFuncUpper_;
-            auto curDistParam = (layer == 0) ? dist_func_param_ : dist_func_param_upper_;
-            size_t curDataSize = (layer == 0) ? data_size_ : data_size_upper_;
+            auto curSimFunc = fstSimFunc_;
+            auto curDistParam = dist_func_param_;
+            size_t curDataSize = data_size_;
             std::vector<uint8_t> buffer;
             if(layer == 0) {
                 buffer.resize(curDataSize);
@@ -1555,10 +1501,12 @@ namespace hnswlib {
 
                     // Phase 2: Batch fetch all vectors
                     std::vector<uint8_t> batch_buffers(valid_ids.size() * data_size_);
+                    std::vector<const void*> batch_ptrs(valid_ids.size(), nullptr);
                     auto batch_success = std::make_unique<bool[]>(valid_ids.size());
                     std::memset(batch_success.get(), 0, valid_ids.size() * sizeof(bool));
                     getDataByInternalIdBatch(valid_ids.data(), batch_buffers.data(),
-                                             batch_success.get(), valid_ids.size());
+                                             batch_success.get(), valid_ids.size(),
+                                             batch_ptrs.data());
 
                     // Phase 3: Process fetched vectors
                     std::vector<idhInt> pass_filter_candidate_ids;
@@ -1570,7 +1518,10 @@ namespace hnswlib {
                         if(!batch_success[vi]) continue;
 
                         idhInt candidate_id = valid_ids[vi];
-                        const void* neighbor_data = batch_buffers.data() + vi * data_size_;
+                        const void* neighbor_data = batch_ptrs[vi];
+                        if(!neighbor_data) {
+                            continue;
+                        }
 
                         bool pass_filter = true;
                         if constexpr(!std::is_same_v<FilterFunctor, void>) {
@@ -1605,7 +1556,6 @@ namespace hnswlib {
                     std::vector<dist_t> pass_filter_sims;
                     computeBatchSimilaritiesFromPtrs(data_point,
                                              pass_filter_ptrs,
-                                             layer,
                                              curSimFunc,
                                              curDistParam,
                                              pass_filter_sims);
