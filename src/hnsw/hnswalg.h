@@ -100,7 +100,7 @@ namespace hnswlib {
             size_t cache_bits = VectorCache::calculateCacheBits(maxElements_);
             if (cache_bits > 0) {
                 vector_cache_ = std::make_unique<VectorCache>(data_size_, cache_bits);
-                LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1 << cache_bits) << " slots");
+                LOG_DEBUG("Vector cache initialized for " << maxElements_ << " elements with " << (1ULL << cache_bits) << " slots");
                 size_t cache_bytes = vector_cache_->getMemoryUsage();
                 LOG_DEBUG("Vector cache allocated: " << cache_bytes << " bytes (" << (cache_bytes / MB) << " MB)");
             }
@@ -527,9 +527,11 @@ namespace hnswlib {
         template <bool is_new> void addPoint(const void* datapoint, idInt label) {
             LOG_TIME("addPoint");
 
-            //std::shared_lock<std::shared_mutex> lock(index_lock_);
+            std::unique_lock<std::shared_mutex> update_lock(index_lock_, std::defer_lock);
+
             idhInt cur_c = 0;
             levelInt curLevel = 0;
+            idhInt update_seed = INVALID_ID;
             if(is_new) {
                 // Adding a new point
                 // Using fetch_add (or post-increment) ensures unique IDs even under contention.
@@ -547,12 +549,46 @@ namespace hnswlib {
             } else {
                 idhInt searchId = labelLookup_[label];
                 if(searchId != INVALID_ID) {
+                    if(searchId == entryPoint_) {
+                        update_lock.lock();
+                    }
+
                     // If the element is deleted, mark is undeleted first before calling update
                     // point
                     if(isMarkedDeleted(searchId)) {
                         unmarkDeletedInternal(searchId);
                     }
                     curLevel = getElementLevel(searchId);
+
+                    // If we're updating the current entry point, pick an alternate traversal seed
+                    // before disconnecting this node. Starting from a just-disconnected entry
+                    // point can degrade into self-only reinsertion.
+                    if(searchId == entryPoint_) {
+                        // Scan from higher levels down, and accept the first valid non-deleted neighbor.
+                        for(int level = curLevel; level >= 0 && update_seed == INVALID_ID; --level) {
+                            idhInt* ll_self = reinterpret_cast<idhInt*>(
+                                    level == 0 ? get_linklist0(searchId)
+                                               : get_linklist(searchId, level));
+                            if(!ll_self) {
+                                continue;
+                            }
+                            idhInt sz = getListCount(ll_self);
+                            idhInt* neighbors = ll_self + 1;
+                            for(idhInt i = 0; i < sz; ++i) {
+                                idhInt candidate = neighbors[i];
+                                if(candidate == searchId || candidate >= curElementsCount_) {
+                                    continue;
+                                }
+                                if(isMarkedDeleted(candidate)) {
+                                    continue;
+                                }
+                                update_seed = candidate;
+                                break;
+                            }
+                        }
+
+                    }
+
                     removeAllConnections(searchId, curLevel);
                     cur_c = searchId;
                 } else {
@@ -560,24 +596,19 @@ namespace hnswlib {
                     return;
                 }
             }
-            // TODO - Check this ..is it thread safe to comment this
-
-            // Put the data in cache. Will speed up initial data load
-            if (vector_cache_) {
-                std::unique_lock<std::shared_timed_mutex> write_lock(
-                        getCacheMutex(cur_c), std::try_to_lock);
-                if(write_lock.owns_lock()) {
-                    vector_cache_->insertNoLock(cur_c, static_cast<const uint8_t*>(datapoint));
+            // Update cached value only if this id is already present in cache.
+            // Do not insert on add/update path; cold ids can be populated on read hot path.
+            if constexpr(!is_new) {
+                if(vector_cache_) {
+                    std::unique_lock<std::shared_timed_mutex> write_lock(getCacheMutex(cur_c));
+                    if(write_lock.owns_lock()) {
+                        vector_cache_->update(cur_c, static_cast<const uint8_t*>(datapoint));
+                    }
                 }
             }
 
             // std::unique_lock <std::shared_mutex> lock_el(getLinkListMutex(cur_c));
 
-            // Put the data in level 0 memory.
-            // if (curLevel == 0) {
-            //      memcpy(dataBaseLayer_ + cur_c * sizeDataAtBaseLayer_ + sizeDataAtBaseLayer_ -
-            //      data_size_, datapoint, data_size_);
-            // }
             // Initialize level 0 links
             // TODO - check if it is required
             {
@@ -610,11 +641,13 @@ namespace hnswlib {
 
                 // IMPORTANT: Check if this element has a higher level than the current max
                 bool has_higher_level = (curLevel > maxlevelcopy);
-                idhInt currObj = entryPoint_;
+                idhInt currObj = (update_seed != INVALID_ID) ? update_seed : entryPoint_;
+                levelInt seed_level = getElementLevel(currObj);
+                levelInt start_search_level = std::min(maxlevelcopy, seed_level);
 
                 // Traverse to find closest neighbors at each level
                 // Greedy search till the current level
-                for(int level = maxlevelcopy; level > curLevel; level--) {
+                for(int level = start_search_level; level > curLevel; level--) {
                     bool changed = true;
                     while(changed) {
                         changed = false;
@@ -654,7 +687,8 @@ namespace hnswlib {
                 }
 
                 // Add connections from curLevel down to 0
-                for(int level = std::min(curLevel, maxlevelcopy); level >= 0; level--) {
+                levelInt connect_start_level = std::min(curLevel, start_search_level);
+                for(int level = connect_start_level; level >= 0; level--) {
                     std::vector<std::pair<dist_t, idhInt>> sorted_candidates;
                     
                     const void* level_datapoint = datapoint;
@@ -781,7 +815,7 @@ namespace hnswlib {
 
         // Cache for vectors
         mutable std::unique_ptr<VectorCache> vector_cache_;
-        static constexpr size_t CACHE_LOCK_STRIPE_BITS = 8; // 256 striped locks in HNSW
+        static constexpr size_t CACHE_LOCK_STRIPE_BITS = 5; // 32 striped locks in HNSW (collision stress)
         static constexpr size_t CACHE_LOCK_STRIPE_COUNT = 1 << CACHE_LOCK_STRIPE_BITS;
         static constexpr size_t CACHE_LOCK_STRIPE_MASK = CACHE_LOCK_STRIPE_COUNT - 1;
         mutable std::array<std::shared_timed_mutex, CACHE_LOCK_STRIPE_COUNT> vectorCacheLocks_;
@@ -875,7 +909,7 @@ namespace hnswlib {
                     if(cache_read_handle) {
                         cache_read_handle->lock =
                                 std::shared_lock<std::shared_timed_mutex>(getCacheMutex(internal_id));
-                        const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_id);
+                        const uint8_t* cached_ptr = vector_cache_->getPointer(internal_id);
                         if(cached_ptr) {
                             cache_read_handle->data = cached_ptr;
                             return true;
@@ -885,7 +919,7 @@ namespace hnswlib {
 
                     if(buffer) {
                         std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_id));
-                        const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_id);
+                        const uint8_t* cached_ptr = vector_cache_->getPointer(internal_id);
                         if(cached_ptr) {
                             memcpy(buffer, cached_ptr, data_size_);
                             return true;
@@ -903,7 +937,7 @@ namespace hnswlib {
                         std::unique_lock<std::shared_timed_mutex> write_lock(
                                 getCacheMutex(internal_id), std::try_to_lock);
                         if(write_lock.owns_lock()) {
-                            vector_cache_->insertNoLock(internal_id, buffer);
+                            vector_cache_->insert(internal_id, buffer);
                         }
                     }
                     return success;
@@ -949,7 +983,7 @@ namespace hnswlib {
 
                 if(vector_cache_) {
                     std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_ids[i]));
-                    const uint8_t* cached_ptr = vector_cache_->getPointerNoLock(internal_ids[i]);
+                    const uint8_t* cached_ptr = vector_cache_->getPointer(internal_ids[i]);
                     if(cached_ptr) {
                         std::memcpy(buf, cached_ptr, data_size_);
                         if(data_ptrs) {
@@ -990,7 +1024,7 @@ namespace hnswlib {
                             std::unique_lock<std::shared_timed_mutex> write_lock(
                                     getCacheMutex(internal_ids[i]), std::try_to_lock);
                             if(write_lock.owns_lock()) {
-                                vector_cache_->insertNoLock(internal_ids[i], buf);
+                                vector_cache_->insert(internal_ids[i], buf);
                             }
                         }
                     }
@@ -1009,7 +1043,7 @@ namespace hnswlib {
                         std::unique_lock<std::shared_timed_mutex> write_lock(
                                 getCacheMutex(internal_ids[i]), std::try_to_lock);
                         if(write_lock.owns_lock()) {
-                            vector_cache_->insertNoLock(internal_ids[i], buf);
+                            vector_cache_->insert(internal_ids[i], buf);
                         }
                     }
                 }
@@ -1284,15 +1318,12 @@ namespace hnswlib {
                     setListCount(ll_other, sz + 1);
                 } else {
                     const void* neighbor_data = nullptr;
-                    CacheReadView neighbor_cache_handle;
                     if(level == 0) {
                         if(getDataByInternalId(neighbor,
                                                level,
                                                neighbor_buf.data(),
-                                               &neighbor_cache_handle)) {
-                            neighbor_data = neighbor_cache_handle
-                                            ? static_cast<const void*>(neighbor_cache_handle.data)
-                                            : static_cast<const void*>(neighbor_buf.data());
+                                               nullptr)) {
+                            neighbor_data = static_cast<const void*>(neighbor_buf.data());
                         }
                     } else {
                         neighbor_data = getUpperLayerDataPtr(neighbor);
@@ -1311,15 +1342,12 @@ namespace hnswlib {
                     for(size_t j = 0; j < sz; j++) {
                         dist_t sim;
                         const void* other_neighbor_data = nullptr;
-                        CacheReadView other_cache_handle;
                         if(level == 0) {
                             if(getDataByInternalId(data[j],
                                                    level,
                                                    data_buf.data(),
-                                                   &other_cache_handle)) {
-                                other_neighbor_data = other_cache_handle
-                                                      ? static_cast<const void*>(other_cache_handle.data)
-                                                      : static_cast<const void*>(data_buf.data());
+                                                   nullptr)) {
+                                other_neighbor_data = static_cast<const void*>(data_buf.data());
                             }
                         } else {
                             other_neighbor_data = getUpperLayerDataPtr(data[j]);
