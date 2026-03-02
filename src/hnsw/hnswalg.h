@@ -605,7 +605,7 @@ namespace hnswlib {
 
             // Initialize level 0 links
             // TODO - check if it is required
-            {
+            if constexpr(is_new) {
                 char* linklist = get_linklist0(cur_c);
                 memset(linklist, 0, sizeLinksBaseLayer_);
             }
@@ -630,9 +630,6 @@ namespace hnswlib {
                     uint8_t* upper_mem = dataUpperLayer_[cur_c].get();
                     memcpy(upper_mem, datapoint, data_size_);
                     memcpy(upper_mem + data_size_, &curLevel, sizeof(levelInt));
-                    memset(upper_mem + data_size_ + sizeof(levelInt),
-                           0,
-                           curLevel * sizeLinksUpperLayers_);
                 }
             }
 
@@ -1285,11 +1282,12 @@ namespace hnswlib {
                 idhInt* ll_cur = reinterpret_cast<idhInt*>(level == 0 ? get_linklist0(cur_c)
                                                                       : get_linklist(cur_c, level));
                 if(ll_cur) {
-                    setListCount(ll_cur, selected.size());
                     idhInt* data = (ll_cur + 1);
                     for(size_t idx = 0; idx < selected.size(); idx++) {
                         data[idx] = selected[idx].second;
                     }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    setListCount(ll_cur, selected.size());
                 }
             }
 
