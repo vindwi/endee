@@ -45,6 +45,11 @@ private:
     
     static constexpr idInt INVALID_ID = static_cast<idInt>(-1);
 
+    static constexpr uint8_t SLOT_LIFE_INVALID = 0;
+    static constexpr uint8_t SLOT_LIFE_COLD = 1;
+    static constexpr uint8_t SLOT_LIFE_WARM = 2;
+    static constexpr uint8_t SLOT_LIFE_HOT = 3;
+
 public:
     VectorCache() = default;
     
@@ -96,7 +101,7 @@ public:
         for (size_t i = 0; i < cacheSize_; i++) {
             idInt* id_ptr = reinterpret_cast<idInt*>(vectorCache_ + i * vectorCacheDataSize_);
             *id_ptr = INVALID_ID;
-            slotLife_[i].store(0, std::memory_order_relaxed);
+            slotLife_[i].store(SLOT_LIFE_INVALID, std::memory_order_relaxed);
         }
     }
     
@@ -109,13 +114,19 @@ public:
         if (!vectorCache_ || !slotLife_) return nullptr;
 
         size_t index = getCacheIndex(internal_id);
+        
+        // If life is invalid, we treat it as a miss regardless of ID
+        if (slotLife_[index].load(std::memory_order_relaxed) == SLOT_LIFE_INVALID) {
+            return nullptr;
+        }
+
         uint8_t* entry = vectorCache_ + index * vectorCacheDataSize_;
         idInt* stored_id = reinterpret_cast<idInt*>(entry);
         if (*stored_id != internal_id) {
             return nullptr;
         }
 
-        slotLife_[index].store(1, std::memory_order_relaxed);
+        slotLife_[index].store(SLOT_LIFE_HOT, std::memory_order_relaxed);
         return entry + sizeof(idInt);
     }
 
@@ -136,22 +147,27 @@ public:
         // Same id: refresh value and restore life.
         if (*stored_id == internal_id) {
             memcpy(entry + sizeof(idInt), data, data_size_);
-            slotLife_[index].store(1, std::memory_order_relaxed);
+            slotLife_[index].store(SLOT_LIFE_HOT, std::memory_order_relaxed);
             return;
         }
 
-        // Different id: one-life policy.
-        // life == 1 -> give one life (flip to 0, do not replace now)
-        // life == 0 -> replace slot and set life back to 1
+        // Different id: three-life policy (eviction protocol).
+        // life == SLOT_LIFE_HOT (3) -> demote to WARM (2), do not replace now.
+        // life == SLOT_LIFE_WARM (2) -> demote to COLD (1), do not replace now.
+        // life == SLOT_LIFE_COLD (1) or INVALID (0) -> replace slot and set life to WARM (2)
+        // Newly inserted items start as WARM. They must be accessed again to become HOT.
         uint8_t life = slotLife_[index].load(std::memory_order_relaxed);
-        if (life != 0) {
-            slotLife_[index].store(0, std::memory_order_relaxed);
+        if (life == SLOT_LIFE_HOT) {
+            slotLife_[index].store(SLOT_LIFE_WARM, std::memory_order_relaxed);
+            return;
+        } else if (life == SLOT_LIFE_WARM) {
+            slotLife_[index].store(SLOT_LIFE_COLD, std::memory_order_relaxed);
             return;
         }
 
         *stored_id = internal_id;
         memcpy(entry + sizeof(idInt), data, data_size_);
-        slotLife_[index].store(1, std::memory_order_relaxed);
+        slotLife_[index].store(SLOT_LIFE_WARM, std::memory_order_relaxed);
     }
 
     // Not thread-safe. Caller must hold the appropriate cache stripe lock.
@@ -169,6 +185,27 @@ public:
         *stored_id = internal_id;
         memcpy(entry + sizeof(idInt), data, data_size_);
         slotLife_[index].store(1, std::memory_order_relaxed);
+    }
+
+    // Atomically invalidate the slot for a given id, forcing a fetch on the next read.
+    // Thread-safe without a cache stripe lock due to atomic memory ordering, 
+    // provided the caller accepts eventual consistency (next reader will miss and lock to fetch).
+    void invalidateSlot(idInt internal_id) {
+        if(!vectorCache_ || !slotLife_) return;
+
+        size_t index = getCacheIndex(internal_id);
+
+        // Only invalidate if the slot currently belongs to this ID, preventing us from accidentally 
+        // invalidating another vector if an eviction happened between our read and invalidate.
+        uint8_t* entry = vectorCache_ + index * vectorCacheDataSize_;
+        idInt* stored_id = reinterpret_cast<idInt*>(entry);
+
+        if (*stored_id == internal_id) {
+            // Note: Data race risk with readers. Even if we set slotLife to INVALID right now, 
+            // a reader might have just checked slotLife and is now about to read `stored_id`.
+            // Because of this, we set slotLife so FUTURE readers instantly miss.
+            slotLife_[index].store(SLOT_LIFE_INVALID, std::memory_order_release);
+        }
     }
     
     size_t getCacheBits() const { return cacheBits_; }

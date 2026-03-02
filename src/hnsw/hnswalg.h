@@ -518,11 +518,6 @@ namespace hnswlib {
             // VECTOR_CACHE_PERCENTAGE) adjustCacheForElementCount(curElementsCount_);
         }
 
-        // Adjust cache bits based on element count and percentage threshold
-        // cache_percent: percentage of element count the cache should cover (e.g., 5 for 5%)
-        // void adjustCacheForElementCount(size_t element_count) {
-        // Cache adjustment is now handled externally or disabled
-        // }
 
         template <bool is_new> void addPoint(const void* datapoint, idInt label) {
             LOG_TIME("addPoint");
@@ -589,7 +584,7 @@ namespace hnswlib {
 
                     }
 
-                    removeAllConnections(searchId, curLevel);
+                    removeAllConnections2(searchId, curLevel);
                     cur_c = searchId;
                 } else {
                     LOG_DEBUG("Label not found, can't update the point" << label);
@@ -600,10 +595,9 @@ namespace hnswlib {
             // Do not insert on add/update path; cold ids can be populated on read hot path.
             if constexpr(!is_new) {
                 if(vector_cache_) {
-                    std::unique_lock<std::shared_timed_mutex> write_lock(getCacheMutex(cur_c));
-                    if(write_lock.owns_lock()) {
-                        vector_cache_->update(cur_c, static_cast<const uint8_t*>(datapoint));
-                    }
+                    // Fast atomic invalidation instead of taking a cache lock that can deadlock.
+                    // The cache will automatically refresh this vector on the next read miss.
+                    vector_cache_->invalidateSlot(cur_c);
                 }
             }
 
@@ -815,13 +809,13 @@ namespace hnswlib {
 
         // Cache for vectors
         mutable std::unique_ptr<VectorCache> vector_cache_;
-        static constexpr size_t CACHE_LOCK_STRIPE_BITS = 5; // 32 striped locks in HNSW (collision stress)
+        static constexpr size_t CACHE_LOCK_STRIPE_BITS = 10; // 1024 striped locks in HNSW
         static constexpr size_t CACHE_LOCK_STRIPE_COUNT = 1 << CACHE_LOCK_STRIPE_BITS;
         static constexpr size_t CACHE_LOCK_STRIPE_MASK = CACHE_LOCK_STRIPE_COUNT - 1;
-        mutable std::array<std::shared_timed_mutex, CACHE_LOCK_STRIPE_COUNT> vectorCacheLocks_;
+        mutable std::array<std::shared_mutex, CACHE_LOCK_STRIPE_COUNT> vectorCacheLocks_;
 
         struct CacheReadView {
-            std::shared_lock<std::shared_timed_mutex> lock;
+            std::shared_lock<std::shared_mutex> lock;
             const uint8_t* data = nullptr;
 
             explicit operator bool() const {
@@ -829,7 +823,7 @@ namespace hnswlib {
             }
         };
 
-        std::shared_timed_mutex& getCacheMutex(idhInt internal_id) const {
+        std::shared_mutex& getCacheMutex(idhInt internal_id) const {
             size_t cache_index = static_cast<size_t>(internal_id);
             if(vector_cache_) {
                 cache_index = vector_cache_->getCacheIndex(internal_id);
@@ -908,7 +902,7 @@ namespace hnswlib {
                 if(vector_cache_) {
                     if(cache_read_handle) {
                         cache_read_handle->lock =
-                                std::shared_lock<std::shared_timed_mutex>(getCacheMutex(internal_id));
+                                std::shared_lock<std::shared_mutex>(getCacheMutex(internal_id));
                         const uint8_t* cached_ptr = vector_cache_->getPointer(internal_id);
                         if(cached_ptr) {
                             cache_read_handle->data = cached_ptr;
@@ -918,7 +912,7 @@ namespace hnswlib {
                     }
 
                     if(buffer) {
-                        std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_id));
+                        std::shared_lock<std::shared_mutex> lock(getCacheMutex(internal_id));
                         const uint8_t* cached_ptr = vector_cache_->getPointer(internal_id);
                         if(cached_ptr) {
                             memcpy(buffer, cached_ptr, data_size_);
@@ -934,8 +928,7 @@ namespace hnswlib {
                     
                     // Populate cache on successful fetch
                     if (success && vector_cache_) {
-                        std::unique_lock<std::shared_timed_mutex> write_lock(
-                                getCacheMutex(internal_id), std::try_to_lock);
+                        std::unique_lock<std::shared_mutex> write_lock(getCacheMutex(internal_id), std::try_to_lock);
                         if(write_lock.owns_lock()) {
                             vector_cache_->insert(internal_id, buffer);
                         }
@@ -982,7 +975,7 @@ namespace hnswlib {
                 }
 
                 if(vector_cache_) {
-                    std::shared_lock<std::shared_timed_mutex> lock(getCacheMutex(internal_ids[i]));
+                    std::shared_lock<std::shared_mutex> lock(getCacheMutex(internal_ids[i]));
                     const uint8_t* cached_ptr = vector_cache_->getPointer(internal_ids[i]);
                     if(cached_ptr) {
                         std::memcpy(buf, cached_ptr, data_size_);
@@ -1021,7 +1014,7 @@ namespace hnswlib {
                         success[i] = true;
                         // Populate cache
                         if(vector_cache_) {
-                            std::unique_lock<std::shared_timed_mutex> write_lock(
+                                std::unique_lock<std::shared_mutex> write_lock(
                                     getCacheMutex(internal_ids[i]), std::try_to_lock);
                             if(write_lock.owns_lock()) {
                                 vector_cache_->insert(internal_ids[i], buf);
@@ -1040,7 +1033,7 @@ namespace hnswlib {
                         data_ptrs[i] = buf;
                     }
                     if(ok && vector_cache_) {
-                        std::unique_lock<std::shared_timed_mutex> write_lock(
+                        std::unique_lock<std::shared_mutex> write_lock(
                                 getCacheMutex(internal_ids[i]), std::try_to_lock);
                         if(write_lock.owns_lock()) {
                             vector_cache_->insert(internal_ids[i], buf);
@@ -1318,12 +1311,15 @@ namespace hnswlib {
                     setListCount(ll_other, sz + 1);
                 } else {
                     const void* neighbor_data = nullptr;
+                    CacheReadView neighbor_cache_handle;
                     if(level == 0) {
                         if(getDataByInternalId(neighbor,
                                                level,
                                                neighbor_buf.data(),
-                                               nullptr)) {
-                            neighbor_data = static_cast<const void*>(neighbor_buf.data());
+                                               &neighbor_cache_handle)) {
+                            neighbor_data = neighbor_cache_handle
+                                            ? static_cast<const void*>(neighbor_cache_handle.data)
+                                            : static_cast<const void*>(neighbor_buf.data());
                         }
                     } else {
                         neighbor_data = getUpperLayerDataPtr(neighbor);
@@ -1342,12 +1338,15 @@ namespace hnswlib {
                     for(size_t j = 0; j < sz; j++) {
                         dist_t sim;
                         const void* other_neighbor_data = nullptr;
+                        CacheReadView other_cache_handle;
                         if(level == 0) {
                             if(getDataByInternalId(data[j],
                                                    level,
                                                    data_buf.data(),
-                                                   nullptr)) {
-                                other_neighbor_data = static_cast<const void*>(data_buf.data());
+                                                   &other_cache_handle)) {
+                                other_neighbor_data = other_cache_handle
+                                                      ? static_cast<const void*>(other_cache_handle.data)
+                                                      : static_cast<const void*>(data_buf.data());
                             }
                         } else {
                             other_neighbor_data = getUpperLayerDataPtr(data[j]);
@@ -1672,6 +1671,8 @@ namespace hnswlib {
             std::reverse(sorted_candidates.begin(), sorted_candidates.end());
             return sorted_candidates;
         }
+        // This function removes all connections to and from the target element across all levels
+        // There is a new version removeAllConnections2 that tries to reconnect neighbors to each other instead of just removing the target element from their lists 
         void removeAllConnections(idhInt internal_id, levelInt elem_level) {
 
             for(int level = 0; level <= elem_level; ++level) {
@@ -1705,6 +1706,149 @@ namespace hnswlib {
                 // Now clear own links (make neighbor count 0)
                 std::unique_lock<std::shared_mutex> lock_self(getLinkListMutex(internal_id));
                 setListCount(ll_self, 0);
+            }
+        }
+        // This is a more efficient version of removeAllConnections that reconnects neighbors to each other  
+        // instead of just removing the target element from their lists
+        void removeAllConnections2(idhInt internal_id, levelInt elem_level) {
+            auto containsNeighborNoLock = [this](idhInt* linklist, idhInt target) {
+                idhInt sz = getListCount(linklist);
+                idhInt* data = linklist + 1;
+                for(idhInt i = 0; i < sz; ++i) {
+                    if(data[i] == target) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            auto connectPair = [&](idhInt left, idhInt right, levelInt level) {
+                if(left == right || left >= curElementsCount_ || right >= curElementsCount_) {
+                    return;
+                }
+
+                size_t max_degree = level ? M_ : M0_;
+                auto& left_mutex = getLinkListMutex(left);
+                auto& right_mutex = getLinkListMutex(right);
+
+                if(&left_mutex == &right_mutex) {
+                    std::unique_lock<std::shared_mutex> lock(left_mutex);
+
+                    idhInt* ll_left = (idhInt*)get_linklist(left, level);
+                    idhInt* ll_right = (idhInt*)get_linklist(right, level);
+                    if(!ll_left || !ll_right) {
+                        return;
+                    }
+
+                    if(containsNeighborNoLock(ll_left, right)
+                       || containsNeighborNoLock(ll_right, left)) {
+                        return;
+                    }
+
+                    idhInt left_sz = getListCount(ll_left);
+                    idhInt right_sz = getListCount(ll_right);
+                    if(left_sz >= static_cast<idhInt>(max_degree)
+                       || right_sz >= static_cast<idhInt>(max_degree)) {
+                        return;
+                    }
+
+                    (ll_left + 1)[left_sz] = right;
+                    (ll_right + 1)[right_sz] = left;
+                    setListCount(ll_left, left_sz + 1);
+                    setListCount(ll_right, right_sz + 1);
+                    return;
+                }
+
+                idhInt first_id = left < right ? left : right;
+                idhInt second_id = left < right ? right : left;
+
+                auto& first_mutex = getLinkListMutex(first_id);
+                auto& second_mutex = getLinkListMutex(second_id);
+
+                std::unique_lock<std::shared_mutex> first_lock(first_mutex);
+                std::unique_lock<std::shared_mutex> second_lock(second_mutex);
+
+                idhInt* ll_left = (idhInt*)get_linklist(left, level);
+                idhInt* ll_right = (idhInt*)get_linklist(right, level);
+                if(!ll_left || !ll_right) {
+                    return;
+                }
+                if(containsNeighborNoLock(ll_left, right)
+                   || containsNeighborNoLock(ll_right, left)) {
+                    return;
+                }
+
+                idhInt left_sz = getListCount(ll_left);
+                idhInt right_sz = getListCount(ll_right);
+                if(left_sz >= static_cast<idhInt>(max_degree)
+                   || right_sz >= static_cast<idhInt>(max_degree)) {
+                    return;
+                }
+
+                (ll_left + 1)[left_sz] = right;
+                (ll_right + 1)[right_sz] = left;
+                setListCount(ll_left, left_sz + 1);
+                setListCount(ll_right, right_sz + 1);
+            };
+
+            for(int level = 0; level <= elem_level; ++level) {
+                idhInt* ll_self = (idhInt*)get_linklist(internal_id, level);
+                if(!ll_self) {
+                    continue;
+                }
+                std::vector<idhInt> level_neighbors;
+
+                {
+                    std::unique_lock<std::shared_mutex> lock_self(getLinkListMutex(internal_id));
+
+                    idhInt size = getListCount(ll_self);
+                    idhInt* neighbors = (idhInt*)(ll_self + 1);
+                    level_neighbors.reserve(size);
+
+                    for(idhInt i = 0; i < size; ++i) {
+                        idhInt neighbor_id = neighbors[i];
+                        if(neighbor_id >= curElementsCount_ || neighbor_id == internal_id) {
+                            continue;
+                        }
+                        level_neighbors.push_back(neighbor_id);
+                    }
+
+                    setListCount(ll_self, 0);
+                }
+
+                std::sort(level_neighbors.begin(), level_neighbors.end());
+                level_neighbors.erase(
+                        std::unique(level_neighbors.begin(), level_neighbors.end()),
+                        level_neighbors.end());
+
+                for(idhInt neighbor_id : level_neighbors) {
+                    std::unique_lock<std::shared_mutex> lock_neighbor(getLinkListMutex(neighbor_id));
+                    idhInt* ll_other = (idhInt*)get_linklist(neighbor_id, level);
+                    if(!ll_other) {
+                        continue;
+                    }
+
+                    idhInt sz = getListCount(ll_other);
+                    idhInt* data = (idhInt*)(ll_other + 1);
+
+                    idhInt new_size = 0;
+                    for(idhInt j = 0; j < sz; ++j) {
+                        if(data[j] != internal_id) {
+                            data[new_size++] = data[j];
+                        }
+                    }
+                    setListCount(ll_other, new_size);
+                }
+
+                size_t left = 0;
+                if(!level_neighbors.empty()) {
+                    size_t right = level_neighbors.size() - 1;
+                    while(left < right) {
+                        connectPair(level_neighbors[left], level_neighbors[right], level);
+                        ++left;
+                        --right;
+                    }
+                }
             }
         }
     };
