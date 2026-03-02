@@ -616,17 +616,24 @@ namespace hnswlib {
 
                 total_size = data_size_ + sizeof(levelInt) + curLevel * sizeLinksUpperLayers_;
 
-                auto mem = std::make_unique<uint8_t[]>(total_size);
+                if constexpr(is_new) {
+                    auto mem = std::make_unique<uint8_t[]>(total_size);
 
-                                // copy vector
-                                memcpy(mem.get(), datapoint, data_size_);
-                                memcpy(mem.get() + data_size_, &curLevel, sizeof(levelInt));
-                // zero initialize linklists
-                                memset(mem.get() + data_size_ + sizeof(levelInt),
-                       0,
-                       curLevel * sizeLinksUpperLayers_);
+                    memcpy(mem.get(), datapoint, data_size_);
+                    memcpy(mem.get() + data_size_, &curLevel, sizeof(levelInt));
+                    memset(mem.get() + data_size_ + sizeof(levelInt),
+                           0,
+                           curLevel * sizeLinksUpperLayers_);
 
-                dataUpperLayer_[cur_c] = std::move(mem);
+                    dataUpperLayer_[cur_c] = std::move(mem);
+                } else {
+                    uint8_t* upper_mem = dataUpperLayer_[cur_c].get();
+                    memcpy(upper_mem, datapoint, data_size_);
+                    memcpy(upper_mem + data_size_, &curLevel, sizeof(levelInt));
+                    memset(upper_mem + data_size_ + sizeof(levelInt),
+                           0,
+                           curLevel * sizeLinksUpperLayers_);
+                }
             }
 
             if(cur_c != 0) {
