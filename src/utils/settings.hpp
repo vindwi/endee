@@ -62,6 +62,8 @@ namespace settings {
     constexpr uint16_t MAX_BLOCK_SIZE = 128;    // Number of elements in a block
     constexpr uint32_t DEFAULT_VOCAB_SIZE = 0;  // 0 means dense vectors only
     constexpr uint8_t DEFAULT_QUANT_BITS = 8;
+    constexpr size_t MAX_BMW_BLOCK_SIZE = 128;
+    constexpr float NEAR_ZERO = 1e-9f;
 
     // Maximum number of elements in the index
     constexpr size_t MAX_VECTORS_ADMIN = 1'000'000'000;
@@ -85,6 +87,7 @@ namespace settings {
     const std::string DEFAULT_SERVER_TYPE = "OSS";
     const std::string DEFAULT_DATA_DIR = "/mnt/data";
     const std::string DEFAULT_SUBINDEX = "default";
+    constexpr size_t MAX_NR_SUBINDEX = 100; //Maximum number of subindexes
     constexpr size_t DEFAULT_MAX_ACTIVE_INDICES = 64;
     constexpr size_t DEFAULT_MAX_ELEMENTS = 100'000;
     constexpr size_t DEFAULT_MAX_ELEMENTS_INCREMENT = 100'000;
