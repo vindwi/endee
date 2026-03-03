@@ -1410,6 +1410,9 @@ namespace hnswlib {
             dist_t lowerBound = std::numeric_limits<dist_t>::lowest();
 
             for (idhInt ep_id : ep_ids) {
+                if(ep_id >= maxElements_) {
+                    continue;
+                }
                 if (visited_array[ep_id] == visited_array_tag) {
                     continue;
                 }
@@ -1494,6 +1497,10 @@ namespace hnswlib {
             while(!candidate_set.empty()) {
                 auto current_pair = candidate_set.top();
                 idhInt current_id = current_pair.second;
+                if(current_id >= maxElements_) {
+                    candidate_set.pop();
+                    continue;
+                }
                 // Early exit if we have enough candidates
                 if(current_pair.first < lowerBound && top_candidates.size() >= ef) {
                     below_threshold_count++;
@@ -1505,6 +1512,12 @@ namespace hnswlib {
                 }
 
                 candidate_set.pop();
+
+                if(layer != 0) {
+                    if(getUpperLayerDataPtr(current_id) == nullptr) {
+                        continue;
+                    }
+                }
 
                 // Get neighbors
                 idhInt* data = (layer == 0) ? (idhInt*)get_linklist0(current_id)
@@ -1523,6 +1536,7 @@ namespace hnswlib {
                     valid_ids.reserve(size);
                     for(idhInt j = 0; j < size; j++) {
                         idhInt candidate_id = *(datal + j);
+                        if(candidate_id >= maxElements_) continue;
                         if(visited_array[candidate_id] == visited_array_tag) continue;
                         visited_array[candidate_id] = visited_array_tag;
                         if(has_deletions && isMarkedDeleted(candidate_id)) continue;
@@ -1614,6 +1628,7 @@ namespace hnswlib {
                     // --- Upper layer path: data is in-memory, no batching needed ---
                     for(idhInt j = 0; j < size; j++) {
                         idhInt candidate_id = *(datal + j);
+                        if(candidate_id >= maxElements_) continue;
                         if(visited_array[candidate_id] == visited_array_tag) continue;
                         visited_array[candidate_id] = visited_array_tag;
                         if(has_deletions && isMarkedDeleted(candidate_id)) continue;
