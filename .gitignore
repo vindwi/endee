@@ -30,3 +30,7 @@ frontend/*
 
 # DS Store
 .DS_Store
+
+#Benchamrks
+benchmarks/
+benchmarks/*
