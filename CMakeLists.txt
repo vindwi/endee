@@ -317,6 +317,51 @@ target_link_libraries(${NDD_BINARY_NAME} PRIVATE
 # Installation rules
 install(TARGETS ${NDD_BINARY_NAME} RUNTIME DESTINATION bin)
 
+# =======================
+# Benchmark
+# =======================
+option(ENABLE_BENCHMARK "Enable building benchmark" OFF)
+if(ENABLE_BENCHMARK)
+    add_executable(ndd-benchmark-base
+        benchmark/neurips_1m_benchmark.cpp
+        ${LMDB_SOURCES}
+        third_party/roaring_bitmap/roaring.c
+    )
+
+    set_source_files_properties(${LMDB_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-DMDBX_BUILD_SHARED_LIBRARY=0 -DMDBX_BUILD_FLAGS=\\\"NDD_EMBEDDED\\\""
+    )
+
+    target_include_directories(ndd-benchmark-base PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${LMDB_INCLUDE_DIR}
+    )
+
+    if(NOT DEBUG)
+        target_compile_options(ndd-benchmark-base PRIVATE -O3 -ffast-math -fno-finite-math-only)
+    endif()
+
+    if(USE_AVX512)
+        target_compile_options(ndd-benchmark-base PRIVATE -mavx512f -mavx512bw -mavx512vnni -mavx512fp16 -mavx512vpopcntdq)
+        target_compile_definitions(ndd-benchmark-base PRIVATE USE_AVX512)
+    elseif(USE_AVX2)
+        target_compile_options(ndd-benchmark-base PRIVATE -mavx2 -mfma -mf16c)
+        target_compile_definitions(ndd-benchmark-base PRIVATE USE_AVX2)
+    elseif(USE_SVE2)
+        target_compile_options(ndd-benchmark-base PRIVATE -march=armv8.6-a+sve2+fp16+dotprod)
+        target_compile_definitions(ndd-benchmark-base PRIVATE USE_SVE2)
+    elseif(USE_NEON)
+        if(APPLE AND (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"))
+            target_compile_options(ndd-benchmark-base PRIVATE -mcpu=native)
+        else()
+            target_compile_options(ndd-benchmark-base PRIVATE -march=armv8.2-a+fp16+fp16fml+dotprod)
+        endif()
+        target_compile_definitions(ndd-benchmark-base PRIVATE USE_NEON)
+    endif()
+
+    target_link_libraries(ndd-benchmark-base PRIVATE Threads::Threads)
+endif()
 
 # =======================
 # Testing

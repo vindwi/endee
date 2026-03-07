@@ -643,6 +643,9 @@ namespace ndd {
             BMWIndex* index;
             MDBX_txn* txn;
 
+            // Preloaded block views to avoid mdbx_get() during search iteration
+            std::vector<BlockView> preloaded_views;
+
             BlockIterator(uint32_t tid,
                             float weight,
                             const BlockIdx* blks,
@@ -672,6 +675,13 @@ namespace ndd {
                         }
                     }
 
+                    // Preload all block views upfront to avoid mdbx_get() per block
+                    preloaded_views.resize(blocks_count);
+                    for(size_t bi = first_block_idx; bi < blocks_count; ++bi) {
+                        preloaded_views[bi] = index->getReadOnlyBlock(
+                                txn, term_id, blocks[bi].start_doc_id);
+                    }
+
                     current_block_idx = first_block_idx;
                     if(current_block_idx < blocks_count) {
                         loadCurrentBlock();
@@ -684,8 +694,8 @@ namespace ndd {
                     current_doc_id = std::numeric_limits<ndd::idInt>::max();
                     return;
                 }
-                const auto& block_meta = blocks[current_block_idx];
-                auto view = index->getReadOnlyBlock(txn, term_id, block_meta.start_doc_id);
+                // Use preloaded view (no mdbx_get in the hot path)
+                const auto& view = preloaded_views[current_block_idx];
                 doc_diffs_ptr = view.doc_diffs;
                 values_ptr = view.values;
                 block_data_size = view.count;
