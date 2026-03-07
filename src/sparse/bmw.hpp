@@ -267,7 +267,7 @@ namespace ndd {
             iterators_storage.reserve(query.indices.size());
 
             // Term block metadata loaded directly from MDBX for this query txn
-            std::vector<std::vector<BlockIdx>> query_blocks_storage;
+            std::vector<TermBlocksView> query_blocks_storage;
             query_blocks_storage.reserve(query.indices.size());
 
             // Pointers for sorting
@@ -275,13 +275,16 @@ namespace ndd {
             iterators.reserve(query.indices.size());
 
             for(size_t i = 0; i < query.indices.size(); ++i) {
-                std::vector<BlockIdx> blocks;
-                if(loadTermIndexForTerm(txn, query.indices[i], blocks) && !blocks.empty()) {
-                    query_blocks_storage.push_back(std::move(blocks));
+                TermBlocksView blocks_view;
+                if(loadTermIndexViewForTerm(txn, query.indices[i], blocks_view)
+                   && blocks_view.size > 0) {
+                    query_blocks_storage.push_back(std::move(blocks_view));
+                    const auto& view = query_blocks_storage.back();
                     iterators_storage.emplace_back(
                             query.indices[i],
                             query.values[i],
-                            &query_blocks_storage.back(),
+                            view.data,
+                            view.size,
                             this,
                             txn);
                 }
@@ -615,6 +618,12 @@ namespace ndd {
 
 
         // Helper struct for getReadOnlyBlock return value
+        struct TermBlocksView {
+            const BlockIdx* data = nullptr;
+            size_t size = 0;
+            std::vector<BlockIdx> owned_blocks;
+        };
+
         struct BlockView {
             const uint16_t* doc_diffs;
             const uint8_t* values;
@@ -625,7 +634,8 @@ namespace ndd {
         struct BlockIterator {
             uint32_t term_id;
             float term_weight;
-            const std::vector<BlockIdx>* blocks;
+            const BlockIdx* blocks;
+            size_t blocks_count;
             size_t first_block_idx;
             size_t current_block_idx;
             float global_term_max;
@@ -644,12 +654,14 @@ namespace ndd {
 
             BlockIterator(uint32_t tid,
                             float weight,
-                            const std::vector<BlockIdx>* blks,
+                            const BlockIdx* blks,
+                            size_t blks_count,
                             BMWIndex* idx,
                             MDBX_txn* t) :
                 term_id(tid),
                 term_weight(weight),
                 blocks(blks),
+                blocks_count(blks_count),
                 first_block_idx(0),
                 current_block_idx(0),
                 global_term_max(0.0f),
@@ -658,30 +670,30 @@ namespace ndd {
                 current_score(0.0f),
                 index(idx),
                 txn(t) {
-                if(blocks && !blocks->empty()) {
-                    if(blocks->front().start_doc_id == BMWIndex::GLOBAL_MAX_SENTINEL_DOC_ID) {
+                if(blocks && blocks_count > 0) {
+                    if(blocks[0].start_doc_id == BMWIndex::GLOBAL_MAX_SENTINEL_DOC_ID) {
                         first_block_idx = 1;
-                        global_term_max = blocks->front().block_max_value;
+                        global_term_max = blocks[0].block_max_value;
                     } else {
                         first_block_idx = 0;
-                        for(const auto& block : *blocks) {
-                            global_term_max = std::max(global_term_max, block.block_max_value);
+                        for(size_t i = 0; i < blocks_count; ++i) {
+                            global_term_max = std::max(global_term_max, blocks[i].block_max_value);
                         }
                     }
 
                     current_block_idx = first_block_idx;
-                    if(current_block_idx < blocks->size()) {
+                    if(current_block_idx < blocks_count) {
                         loadCurrentBlock();
                     }
                 }
             }
 
             void loadCurrentBlock() {
-                if(current_block_idx >= blocks->size()) {
+                if(current_block_idx >= blocks_count) {
                     current_doc_id = std::numeric_limits<ndd::idInt>::max();
                     return;
                 }
-                const auto& block_meta = (*blocks)[current_block_idx];
+                const auto& block_meta = blocks[current_block_idx];
                 auto view = index->getReadOnlyBlock(txn, term_id, block_meta.start_doc_id);
                 doc_diffs_ptr = view.doc_diffs;
                 values_ptr = view.values;
@@ -712,7 +724,7 @@ namespace ndd {
 
                 // Fast path: check if current entry is already live
                 if(current_entry_idx < block_data_size && isLiveAt(current_entry_idx)) {
-                    const auto& block_meta = (*blocks)[current_block_idx];
+                    const auto& block_meta = blocks[current_block_idx];
                     current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
                     current_score = valueAt(current_entry_idx);
                     return;
@@ -721,7 +733,7 @@ namespace ndd {
                 current_entry_idx = findNextLive(current_entry_idx);
 
                 if(current_entry_idx < block_data_size) {
-                    const auto& block_meta = (*blocks)[current_block_idx];
+                    const auto& block_meta = blocks[current_block_idx];
                     current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
                     current_score = valueAt(current_entry_idx);
                     return;
@@ -746,18 +758,20 @@ namespace ndd {
 
             // Specialized advance for 16-bit
             void advance16(ndd::idInt target_doc_id) {
-                if(current_block_idx < blocks->size()) {
-                    const auto& cur_block = (*blocks)[current_block_idx];
+                if(current_block_idx < blocks_count) {
+                    const auto& cur_block = blocks[current_block_idx];
                     ndd::idInt cur_block_end =
                         cur_block.start_doc_id + cur_block.end_doc_id_diff;
                     if(cur_block_end < target_doc_id) {
-                        auto it = std::upper_bound(blocks->begin() + current_block_idx,
-                                                   blocks->end(),
+                        const BlockIdx* begin = blocks + current_block_idx;
+                        const BlockIdx* end = blocks + blocks_count;
+                        auto it = std::upper_bound(begin,
+                                                   end,
                                                    target_doc_id,
                                                    [](ndd::idInt id, const BlockIdx& b) {
                                                        return id < b.start_doc_id;
                                                    });
-                        size_t next_idx = std::distance(blocks->begin(), it);
+                        size_t next_idx = static_cast<size_t>(it - blocks);
                         if(next_idx > 0) {
                             current_block_idx = next_idx - 1;
                             // Reset state for new block
@@ -773,11 +787,11 @@ namespace ndd {
                     loadCurrentBlock();
                 }
 
-                if(current_block_idx >= blocks->size()) {
+                if(current_block_idx >= blocks_count) {
                     return;
                 }
 
-                const auto& block_meta = (*blocks)[current_block_idx];
+                const auto& block_meta = blocks[current_block_idx];
                 if(target_doc_id > block_meta.start_doc_id) {
                     ndd::idInt diff = target_doc_id - block_meta.start_doc_id;
                     if(diff > UINT16_MAX) {
@@ -794,10 +808,10 @@ namespace ndd {
             }
 
             float upperBound() const {
-                if(current_block_idx >= blocks->size()) {
+                if(current_block_idx >= blocks_count) {
                     return 0.0f;
                 }
-                return term_weight * (*blocks)[current_block_idx].block_max_value;
+                return term_weight * blocks[current_block_idx].block_max_value;
             }
 
             float globalUpperBound() const { return term_weight * global_term_max; }
@@ -1130,6 +1144,89 @@ namespace ndd {
                 blocks.insert(blocks.begin(), BlockIdx(GLOBAL_MAX_SENTINEL_DOC_ID, global_max));
             }
 
+            return true;
+        }
+
+        bool loadTermIndexViewForTerm(MDBX_txn* txn,
+                                      uint32_t term_id,
+                                      TermBlocksView& view) const {
+            view.data = nullptr;
+            view.size = 0;
+            view.owned_blocks.clear();
+
+            MDBX_val key;
+            key.iov_base = const_cast<void*>(static_cast<const void*>(&term_id));
+            key.iov_len = sizeof(uint32_t);
+
+            MDBX_val data;
+            int rc = mdbx_get(txn, term_blocks_index_dbi_, &key, &data);
+            if(rc == MDBX_NOTFOUND) {
+                return true;
+            }
+            if(rc != MDBX_SUCCESS) {
+                LOG_ERROR("Failed to load term index view for term " << term_id << ": "
+                                                                      << mdbx_strerror(rc));
+                return false;
+            }
+
+            if((data.iov_len % sizeof(BlockIdx)) == 0) {
+                size_t count = data.iov_len / sizeof(BlockIdx);
+                if(count == 0) {
+                    return true;
+                }
+
+                const BlockIdx* mapped_blocks = static_cast<const BlockIdx*>(data.iov_base);
+                if(mapped_blocks[0].start_doc_id == GLOBAL_MAX_SENTINEL_DOC_ID) {
+                    view.data = mapped_blocks;
+                    view.size = count;
+                    return true;
+                }
+
+                float global_max = 0.0f;
+                for(size_t i = 0; i < count; ++i) {
+                    global_max = std::max(global_max, mapped_blocks[i].block_max_value);
+                }
+
+                view.owned_blocks.reserve(count + 1);
+                view.owned_blocks.emplace_back(GLOBAL_MAX_SENTINEL_DOC_ID, global_max);
+                view.owned_blocks.insert(
+                        view.owned_blocks.end(), mapped_blocks, mapped_blocks + count);
+                view.data = view.owned_blocks.data();
+                view.size = view.owned_blocks.size();
+                return true;
+            }
+
+            struct LegacyBlockIdx {
+                ndd::idInt start_doc_id;
+                float block_max_value;
+            };
+
+            if((data.iov_len % sizeof(LegacyBlockIdx)) != 0) {
+                return false;
+            }
+
+            size_t count = data.iov_len / sizeof(LegacyBlockIdx);
+            const auto* legacy = static_cast<const LegacyBlockIdx*>(data.iov_base);
+            if(count == 0) {
+                return true;
+            }
+
+            float global_max = 0.0f;
+            for(size_t i = 0; i < count; ++i) {
+                global_max = std::max(global_max, legacy[i].block_max_value);
+            }
+
+            view.owned_blocks.reserve(count + 1);
+            view.owned_blocks.emplace_back(GLOBAL_MAX_SENTINEL_DOC_ID, global_max);
+            for(size_t i = 0; i < count; ++i) {
+                view.owned_blocks.emplace_back(
+                        legacy[i].start_doc_id,
+                        legacy[i].block_max_value,
+                        std::numeric_limits<uint16_t>::max());
+            }
+
+            view.data = view.owned_blocks.data();
+            view.size = view.owned_blocks.size();
             return true;
         }
 
