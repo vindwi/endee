@@ -37,7 +37,30 @@
 
 #include "sparse_vector.hpp"
 
+#if defined(__APPLE__) || defined(__linux__)
+#    include <arpa/inet.h>  // htonl / ntohl
+#else
+#    include <winsock2.h>
+#endif
+
 namespace ndd {
+
+    // --------------- Big-endian key helpers ---------------
+    // MDBX orders keys by memcmp. Storing uint32_t in big-endian
+    // ensures memcmp ordering == integer ordering, so MDBX_NEXT
+    // traverses blocks in correct (term_id, start_doc_id) order.
+    struct __attribute__((packed)) BlockKey {
+        uint32_t be_term_id;
+        uint32_t be_doc_id;
+    };
+    static_assert(sizeof(BlockKey) == 8, "BlockKey must be exactly 8 bytes");
+
+    inline BlockKey makeBlockKey(uint32_t term_id, ndd::idInt doc_id) {
+        return {htonl(term_id), htonl(doc_id)};
+    }
+
+    inline uint32_t blockKeyTermId(const BlockKey& k) { return ntohl(k.be_term_id); }
+    inline ndd::idInt blockKeyDocId(const BlockKey& k) { return ntohl(k.be_doc_id); }
 
 #pragma pack(push, 1)
     struct BlockIdx {
@@ -60,10 +83,18 @@ namespace ndd {
         float block_scale = 0.0f;
 
         static constexpr size_t HEADER_SIZE = 8;
+        // AoS entry: {uint16_t doc_diff, uint8_t value} = 3 bytes
         static constexpr size_t ENTRY_SIZE = sizeof(uint16_t) + sizeof(uint8_t);
     };
 
-    // Entry in a block (In-memory representation)
+    // On-disk AoS entry (packed, 3 bytes)
+    struct __attribute__((packed)) AoSEntry {
+        uint16_t doc_diff;
+        uint8_t value;
+    };
+    static_assert(sizeof(AoSEntry) == 3, "AoSEntry must be exactly 3 bytes");
+
+    // Entry in a block (In-memory representation, float value)
     struct BlockEntry {
         uint16_t doc_diff;  // difference from block start_doc_id
         float value;        // stored as float in memory, quantized to uint8 on disk
@@ -615,9 +646,10 @@ namespace ndd {
             std::vector<BlockIdx> owned_blocks;
         };
 
+        // Zero-copy view into an AoS block in MDBX mmap'd pages.
+        // entries points to a contiguous array of packed AoSEntry structs.
         struct BlockView {
-            const uint16_t* doc_diffs;
-            const uint8_t* values;
+            const AoSEntry* entries;
             size_t count;
             float block_scale;
         };
@@ -631,9 +663,8 @@ namespace ndd {
             size_t current_block_idx;
             float global_term_max;
 
-            // SoA pointers
-            const uint16_t* doc_diffs_ptr = nullptr;
-            const uint8_t* values_ptr = nullptr;
+            // AoS pointer: each entry is {uint16_t doc_diff, uint8_t value}
+            const AoSEntry* entries_ptr = nullptr;
             size_t block_data_size = 0;
             float block_scale = 0.0f;
 
@@ -675,12 +706,11 @@ namespace ndd {
                         }
                     }
 
-                    // Preload all block views upfront to avoid mdbx_get() per block
+                    // Preload all block views via cursor NEXT (O(1) per block)
                     preloaded_views.resize(blocks_count);
-                    for(size_t bi = first_block_idx; bi < blocks_count; ++bi) {
-                        preloaded_views[bi] = index->getReadOnlyBlock(
-                                txn, term_id, blocks[bi].start_doc_id);
-                    }
+                    index->preloadBlockViewsCursor(
+                            txn, term_id, blocks, first_block_idx, blocks_count,
+                            preloaded_views);
 
                     current_block_idx = first_block_idx;
                     if(current_block_idx < blocks_count) {
@@ -694,10 +724,9 @@ namespace ndd {
                     current_doc_id = std::numeric_limits<ndd::idInt>::max();
                     return;
                 }
-                // Use preloaded view (no mdbx_get in the hot path)
+                // Use preloaded AoS view (no mdbx_get in the hot path)
                 const auto& view = preloaded_views[current_block_idx];
-                doc_diffs_ptr = view.doc_diffs;
-                values_ptr = view.values;
+                entries_ptr = view.entries;
                 block_data_size = view.count;
                 block_scale = view.block_scale;
                 current_entry_idx = 0;
@@ -705,40 +734,37 @@ namespace ndd {
             }
 
             inline float valueAt(size_t idx) const {
-                return dequantize(values_ptr[idx], block_scale);
+                return dequantize(entries_ptr[idx].value, block_scale);
             }
 
             inline bool isLiveAt(size_t idx) const {
-                return values_ptr[idx] != 0;
-            }
-
-            inline size_t findNextLive(size_t start_idx) const {
-                return index->findNextLiveSIMDU8(values_ptr, block_data_size, start_idx);
+                return entries_ptr[idx].value != 0;
             }
 
             inline void advanceToNextLive() {
-                advanceToNextLive16();
+                advanceToNextLiveAoS();
             }
 
-            inline void advanceToNextLive16() {
-                auto diff_ptr = static_cast<const uint16_t*>(doc_diffs_ptr);
-
+            inline void advanceToNextLiveAoS() {
                 // Fast path: check if current entry is already live
                 if(current_entry_idx < block_data_size && isLiveAt(current_entry_idx)) {
                     const auto& block_meta = blocks[current_block_idx];
-                    current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
+                    current_doc_id = block_meta.start_doc_id + entries_ptr[current_entry_idx].doc_diff;
                     current_score = valueAt(current_entry_idx);
                     return;
                 }
 
-                current_entry_idx = findNextLive(current_entry_idx);
-
-                if(current_entry_idx < block_data_size) {
-                    const auto& block_meta = blocks[current_block_idx];
-                    current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
-                    current_score = valueAt(current_entry_idx);
-                    return;
+                // Scan AoS entries for next live entry
+                while(current_entry_idx < block_data_size) {
+                    if(entries_ptr[current_entry_idx].value != 0) {
+                        const auto& block_meta = blocks[current_block_idx];
+                        current_doc_id = block_meta.start_doc_id + entries_ptr[current_entry_idx].doc_diff;
+                        current_score = valueAt(current_entry_idx);
+                        return;
+                    }
+                    current_entry_idx++;
                 }
+
                 // Block exhausted
                 current_block_idx++;
                 loadCurrentBlock();
@@ -746,7 +772,7 @@ namespace ndd {
 
             inline void next() {
                 current_entry_idx++;
-                advanceToNextLive16();
+                advanceToNextLiveAoS();
             }
 
             void advance(ndd::idInt target_doc_id) {
@@ -754,11 +780,11 @@ namespace ndd {
                     return;
                 }
 
-                advance16(target_doc_id);
+                advanceAoS(target_doc_id);
             }
 
-            // Specialized advance for 16-bit
-            void advance16(ndd::idInt target_doc_id) {
+            // Advance to target doc_id using AoS entries
+            void advanceAoS(ndd::idInt target_doc_id) {
                 if(current_block_idx < blocks_count) {
                     const auto& cur_block = blocks[current_block_idx];
                     ndd::idInt cur_block_end =
@@ -777,8 +803,7 @@ namespace ndd {
                             current_block_idx = next_idx - 1;
                             // Reset state for new block
                             current_entry_idx = 0;
-                            doc_diffs_ptr = nullptr;
-                            values_ptr = nullptr;
+                            entries_ptr = nullptr;
                             block_data_size = 0;
                         }
                     }
@@ -798,13 +823,14 @@ namespace ndd {
                     if(diff > UINT16_MAX) {
                         current_entry_idx = block_data_size;
                     } else {
-                        current_entry_idx = index->findEntryIndexSIMD16(
-                                static_cast<const uint16_t*>(doc_diffs_ptr),
-                                block_data_size,
-                                current_entry_idx,
-                                static_cast<uint16_t>(diff));
+                        // Linear scan of AoS entries for target diff
+                        uint16_t target_diff = static_cast<uint16_t>(diff);
+                        while(current_entry_idx < block_data_size
+                              && entries_ptr[current_entry_idx].doc_diff < target_diff) {
+                            current_entry_idx++;
+                        }
                     }
-                    advanceToNextLive16();
+                    advanceToNextLiveAoS();
                 }
             }
 
@@ -1329,17 +1355,11 @@ namespace ndd {
 
         std::vector<BlockEntry>
         loadBlock(MDBX_txn* txn, uint32_t term_id, ndd::idInt start_doc_id) {
-            // Zero-copy key creation
-            struct {
-                uint32_t t;
-                ndd::idInt d;
-            } __attribute__((packed)) key_struct;
-            key_struct.t = term_id;
-            key_struct.d = start_doc_id;
+            BlockKey bk = makeBlockKey(term_id, start_doc_id);
 
             MDBX_val key;
-            key.iov_base = &key_struct;
-            key.iov_len = sizeof(key_struct);
+            key.iov_base = &bk;
+            key.iov_len = sizeof(bk);
 
             MDBX_val data;
             int rc = mdbx_get(txn, term_blocks_dbi_, &key, &data);
@@ -1359,15 +1379,13 @@ namespace ndd {
                 const size_t n = payload_size / BlockHeader::ENTRY_SIZE;
                 entries.resize(n);
 
-                const uint8_t* ptr =
-                        static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader);
-                const uint16_t* diffs = reinterpret_cast<const uint16_t*>(ptr);
-                const uint8_t* vals = reinterpret_cast<const uint8_t*>(
-                        ptr + n * sizeof(uint16_t));
+                // AoS layout: array of packed {uint16_t doc_diff, uint8_t value}
+                const AoSEntry* aos = reinterpret_cast<const AoSEntry*>(
+                        static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader));
 
                 for(size_t i = 0; i < n; ++i) {
-                    entries[i].doc_diff = diffs[i];
-                    entries[i].value = dequantize(vals[i], header->block_scale);
+                    entries[i].doc_diff = aos[i].doc_diff;
+                    entries[i].value = dequantize(aos[i].value, header->block_scale);
                 }
             }
             return entries;
@@ -1378,17 +1396,11 @@ namespace ndd {
                        ndd::idInt start_doc_id,
                        const std::vector<BlockEntry>& entries,
                        BlockHeader& header) {
-            // Zero-copy key creation
-            struct {
-                uint32_t t;
-                ndd::idInt d;
-            } __attribute__((packed)) key_struct;
-            key_struct.t = term_id;
-            key_struct.d = start_doc_id;
+            BlockKey bk = makeBlockKey(term_id, start_doc_id);
 
             MDBX_val key;
-            key.iov_base = &key_struct;
-            key.iov_len = sizeof(key_struct);
+            key.iov_base = &bk;
+            key.iov_len = sizeof(bk);
 
             size_t n = entries.size();
 
@@ -1401,7 +1413,7 @@ namespace ndd {
                     max_val = e.value;
                 }
                 if(e.value > 1e-9f) {
-                    live++;  // Approximate check for float > 0
+                    live++;
                 }
             }
 
@@ -1418,19 +1430,11 @@ namespace ndd {
             // Copy header
             std::memcpy(buffer.data(), &header, sizeof(BlockHeader));
 
-            uint8_t* ptr = buffer.data() + sizeof(BlockHeader);
-
-            // Copy doc_diffs
-            uint16_t* diffs = reinterpret_cast<uint16_t*>(ptr);
+            // AoS layout: write packed {uint16_t doc_diff, uint8_t value} entries
+            AoSEntry* aos = reinterpret_cast<AoSEntry*>(buffer.data() + sizeof(BlockHeader));
             for(size_t i = 0; i < n; ++i) {
-                diffs[i] = entries[i].doc_diff;
-            }
-            ptr += n * sizeof(uint16_t);
-
-            // Copy uint8 values
-            uint8_t* values = reinterpret_cast<uint8_t*>(ptr);
-            for(size_t i = 0; i < n; ++i) {
-                values[i] = quantize(entries[i].value, header.block_scale);
+                aos[i].doc_diff = entries[i].doc_diff;
+                aos[i].value = quantize(entries[i].value, header.block_scale);
             }
 
             MDBX_val data;
@@ -1442,16 +1446,11 @@ namespace ndd {
         }
 
         bool deleteBlock(MDBX_txn* txn, uint32_t term_id, ndd::idInt start_doc_id) {
-            struct {
-                uint32_t t;
-                ndd::idInt d;
-            } __attribute__((packed)) key_struct;
-            key_struct.t = term_id;
-            key_struct.d = start_doc_id;
+            BlockKey bk = makeBlockKey(term_id, start_doc_id);
 
             MDBX_val key;
-            key.iov_base = &key_struct;
-            key.iov_len = sizeof(key_struct);
+            key.iov_base = &bk;
+            key.iov_len = sizeof(bk);
 
             int rc = mdbx_del(txn, term_blocks_dbi_, &key, nullptr);
             return rc == MDBX_SUCCESS || rc == MDBX_NOTFOUND;
@@ -1522,19 +1521,13 @@ namespace ndd {
             return true;
         }
 
-        // Returns pointer to block data valid for the duration of txn
+        // Returns pointer to block data valid for the duration of txn (AoS layout)
         BlockView getReadOnlyBlock(MDBX_txn* txn, uint32_t term_id, ndd::idInt start_doc_id) {
-            // Zero-copy key creation on stack
-            struct {
-                uint32_t t;
-                ndd::idInt d;
-            } __attribute__((packed)) key_struct;
-            key_struct.t = term_id;
-            key_struct.d = start_doc_id;
+            BlockKey bk = makeBlockKey(term_id, start_doc_id);
 
             MDBX_val key;
-            key.iov_base = &key_struct;
-            key.iov_len = sizeof(key_struct);
+            key.iov_base = &bk;
+            key.iov_len = sizeof(bk);
 
             MDBX_val data;
             int rc = mdbx_get(txn, term_blocks_dbi_, &key, &data);
@@ -1544,20 +1537,73 @@ namespace ndd {
 
                 const size_t payload_size = data.iov_len - sizeof(BlockHeader);
                 if(payload_size % BlockHeader::ENTRY_SIZE != 0) {
-                    return {nullptr, nullptr, 0, 0.0f};
+                    return {nullptr, 0, 0.0f};
                 }
 
                 const size_t n = payload_size / BlockHeader::ENTRY_SIZE;
-                const uint8_t* ptr =
-                        static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader);
+                const AoSEntry* aos = reinterpret_cast<const AoSEntry*>(
+                        static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader));
 
-                const uint16_t* doc_diffs = reinterpret_cast<const uint16_t*>(ptr);
-                const uint8_t* values =
-                    reinterpret_cast<const uint8_t*>(ptr + n * sizeof(uint16_t));
-
-                return {doc_diffs, values, n, header->block_scale};
+                return {aos, n, header->block_scale};
             }
-            return {nullptr, nullptr, 0, 0.0f};
+            return {nullptr, 0, 0.0f};
+        }
+
+        // Preload all block views for a term using cursor NEXT — O(1) per block.
+        // Big-endian keys ensure cursor traverses blocks in (term_id, doc_id) order.
+        void preloadBlockViewsCursor(MDBX_txn* txn,
+                                     uint32_t term_id,
+                                     const BlockIdx* blocks,
+                                     size_t first_block_idx,
+                                     size_t blocks_count,
+                                     std::vector<BlockView>& views) {
+            if(first_block_idx >= blocks_count) return;
+
+            MDBX_cursor* cursor = nullptr;
+            int rc = mdbx_cursor_open(txn, term_blocks_dbi_, &cursor);
+            if(rc != MDBX_SUCCESS) {
+                // Fallback to individual mdbx_get
+                for(size_t bi = first_block_idx; bi < blocks_count; ++bi) {
+                    views[bi] = getReadOnlyBlock(txn, term_id, blocks[bi].start_doc_id);
+                }
+                return;
+            }
+
+            // Position cursor at first block using SET_RANGE
+            BlockKey bk = makeBlockKey(term_id, blocks[first_block_idx].start_doc_id);
+            MDBX_val key;
+            key.iov_base = &bk;
+            key.iov_len = sizeof(bk);
+
+            MDBX_val data;
+            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+
+            for(size_t bi = first_block_idx; bi < blocks_count && rc == MDBX_SUCCESS; ++bi) {
+                // Verify this key belongs to our term
+                if(key.iov_len == sizeof(BlockKey)) {
+                    const BlockKey* found_key = static_cast<const BlockKey*>(key.iov_base);
+                    if(blockKeyTermId(*found_key) != term_id) {
+                        // Past our term — remaining blocks get empty views
+                        break;
+                    }
+                }
+
+                if(data.iov_len >= sizeof(BlockHeader)) {
+                    const BlockHeader* header = reinterpret_cast<const BlockHeader*>(data.iov_base);
+                    const size_t payload_size = data.iov_len - sizeof(BlockHeader);
+                    if(payload_size % BlockHeader::ENTRY_SIZE == 0) {
+                        const size_t n = payload_size / BlockHeader::ENTRY_SIZE;
+                        const AoSEntry* aos = reinterpret_cast<const AoSEntry*>(
+                                static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader));
+                        views[bi] = {aos, n, header->block_scale};
+                    }
+                }
+
+                // Move to next block — O(1) cursor NEXT
+                rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+            }
+
+            mdbx_cursor_close(cursor);
         }
 
         ndd::idInt getBlockEndDocId(const std::vector<BlockIdx>& blocks, size_t block_idx) const {
