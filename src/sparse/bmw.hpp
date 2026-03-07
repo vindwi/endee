@@ -42,34 +42,34 @@ namespace ndd {
 #pragma pack(push, 1)
     struct BlockIdx {
         ndd::idInt start_doc_id;
+        uint16_t end_doc_id_diff;
         float block_max_value;
 
         BlockIdx() = default;
-        BlockIdx(ndd::idInt start, float max_val) :
+        BlockIdx(ndd::idInt start, float max_val, uint16_t end_diff = 0) :
             start_doc_id(start),
+            end_doc_id_diff(end_diff),
             block_max_value(max_val) {}
     };
 
     // Block header for term_blocks data
     struct BlockHeader {
-        uint8_t version = 3;      // Version 3: SoA layout, uint8 values (quantized)
-        uint8_t diff_bits = 16;   // 16, 32, or 64 bit doc diffs. Default to 16 for compression.
-        uint16_t n = 0;           // total stored (incl. tombstones)
-        uint16_t live_count = 0;  // nonzero entries
-        uint16_t padding = 0;     // explicit padding
-        float block_max_value = 0.0f;  // max value in block (for WAND)
-        uint32_t alignment_pad = 0;    // Ensure 16-byte alignment for payload
+        uint8_t version = 1;
+        uint8_t params = 0;
+        uint16_t live_count = 0;
+        float block_scale = 0.0f;
 
-        static constexpr size_t HEADER_SIZE = 16;
+        static constexpr size_t HEADER_SIZE = 8;
+        static constexpr size_t ENTRY_SIZE = sizeof(uint16_t) + sizeof(uint8_t);
     };
 
     // Entry in a block (In-memory representation)
     struct BlockEntry {
-        ndd::idInt doc_diff;  // difference from block start_doc_id
-        float value;          // stored as float in memory, quantized to uint8 on disk
+        uint16_t doc_diff;  // difference from block start_doc_id
+        float value;        // stored as float in memory, quantized to uint8 on disk
 
         BlockEntry() = default;
-        BlockEntry(ndd::idInt diff, float val) :
+        BlockEntry(uint16_t diff, float val) :
             doc_diff(diff),
             value(val) {}
 
@@ -94,7 +94,7 @@ namespace ndd {
 
     class BMWIndex {
     public:
-        static constexpr uint8_t CURRENT_VERSION = 3;
+        static constexpr uint8_t CURRENT_VERSION = 1;
 
         BMWIndex(MDBX_env* env, size_t vocab_size) :
             env_(env),
@@ -136,8 +136,7 @@ namespace ndd {
                 return false;
             }
 
-            // Load existing term blocks index
-            return loadTermBlocksIndex();
+            return true;
         }
 
         // Document management
@@ -267,15 +266,24 @@ namespace ndd {
             std::vector<BlockIterator> iterators_storage;
             iterators_storage.reserve(query.indices.size());
 
+            // Term block metadata loaded directly from MDBX for this query txn
+            std::vector<std::vector<BlockIdx>> query_blocks_storage;
+            query_blocks_storage.reserve(query.indices.size());
+
             // Pointers for sorting
             std::vector<BlockIterator*> iterators;
             iterators.reserve(query.indices.size());
 
             for(size_t i = 0; i < query.indices.size(); ++i) {
-                auto it = term_blocks_index_.find(query.indices[i]);
-                if(it != term_blocks_index_.end()) {
+                std::vector<BlockIdx> blocks;
+                if(loadTermIndexForTerm(txn, query.indices[i], blocks) && !blocks.empty()) {
+                    query_blocks_storage.push_back(std::move(blocks));
                     iterators_storage.emplace_back(
-                            query.indices[i], query.values[i], &it->second, this, txn);
+                            query.indices[i],
+                            query.values[i],
+                            &query_blocks_storage.back(),
+                            this,
+                            txn);
                 }
             }
 
@@ -451,9 +459,10 @@ namespace ndd {
             second_half.reserve(entries.size() - split_idx);
 
             // Re-calculate diffs for second half
-            ndd::idInt base_diff = entries[split_idx].doc_diff;
+            uint16_t base_diff = entries[split_idx].doc_diff;
             for(size_t i = split_idx; i < entries.size(); ++i) {
-                second_half.emplace_back(entries[i].doc_diff - base_diff, entries[i].value);
+                second_half.emplace_back(
+                        static_cast<uint16_t>(entries[i].doc_diff - base_diff), entries[i].value);
             }
 
             // Calculate max values for both new blocks
@@ -472,17 +481,10 @@ namespace ndd {
 
             // Update first block metadata
             block_it->block_max_value = max1;
+            block_it->end_doc_id_diff = first_half.back().doc_diff;
 
             // Save first block
             BlockHeader h1;
-            h1.n = static_cast<uint16_t>(first_half.size());
-            h1.live_count = 0;
-            for(const auto& e : first_half) {
-                if(e.value > 0) {
-                    h1.live_count++;
-                }
-            }
-            h1.block_max_value = max1;
 
             if(!saveBlock(txn, term_id, start_doc_id, first_half, h1)) {
                 return false;
@@ -491,18 +493,11 @@ namespace ndd {
             // Insert second block metadata
             // Note: block_it might be invalidated by insert, so calculate index first
             size_t idx = std::distance(blocks.begin(), block_it);
-            blocks.insert(blocks.begin() + idx + 1, BlockIdx(new_start_doc_id, max2));
+            blocks.insert(blocks.begin() + idx + 1,
+                          BlockIdx(new_start_doc_id, max2, second_half.back().doc_diff));
 
             // Save second block
             BlockHeader h2;
-            h2.n = static_cast<uint16_t>(second_half.size());
-            h2.live_count = 0;
-            for(const auto& e : second_half) {
-                if(e.value > 0) {
-                    h2.live_count++;
-                }
-            }
-            h2.block_max_value = max2;
 
             if(!saveBlock(txn, term_id, new_start_doc_id, second_half, h2)) {
                 return false;
@@ -586,43 +581,45 @@ namespace ndd {
 
         /**
          * The quantize and dequantize functions are there to reduce the memory
-         * and storage footprint of the sparse values (float 32 to int8).
+         * and storage footprint of the sparse values (float 32 to uint8).
          *
          * XXX: Here we are assuming that sparse vectors can never have -ve values.
          */
-        // Helper for uint8 quantization
-        static inline uint8_t quantize(float val, float max_val) {
-            if(max_val <= settings::NEAR_ZERO) {
+        // Quantize to uint8. 0 is reserved as tombstone.
+        static inline uint8_t quantize(float val, float block_scale) {
+            if(block_scale <= settings::NEAR_ZERO || val <= 0.0f) {
                 return 0;
             }
-            float scaled = (val / max_val) * UINT8_MAX;
-            if(scaled >= UINT8_MAX) {
-                return UINT8_MAX;
-            }
-            if (scaled <= 0.0f)   return 0;
 
-            return static_cast<uint8_t>(scaled + 0.5f);
+            float qf = val / block_scale;
+            if(qf >= UINT8_MAX) {
+                qf = UINT8_MAX;
+            }
+            if(qf < 1.0f) {
+                qf = 1.0f;
+            }
+            return static_cast<uint8_t>(qf + 0.5f);
         }
 
-        static inline float dequantize(uint8_t val, float max_val) {
-            // If max_val is near zero, the result is effectively zero
-            if (max_val <= settings::NEAR_ZERO) {
+        static inline float dequantize(uint8_t val, float block_scale) {
+            if(block_scale <= settings::NEAR_ZERO) {
                 return 0.0f;
             }
 
-            // Use a single multiplier to avoid multiple floating point ops
-            const float scale = max_val / UINT8_MAX;
-            return static_cast<float>(val) * scale;
+            return static_cast<float>(val) * block_scale;
+        }
+
+        static inline float blockMaxFromScale(float block_scale) {
+            return block_scale * UINT8_MAX;
         }
 
 
         // Helper struct for getReadOnlyBlock return value
         struct BlockView {
-            const void* doc_diffs;  // Can be uint16_t* or uint32_t*
-            const void* values;
+            const uint16_t* doc_diffs;
+            const uint8_t* values;
             size_t count;
-            uint8_t diff_bits;  // 16 or 32
-            uint8_t value_bits; // 8 (quantized) or 32 (float)
+            float block_scale;
         };
 
         struct BlockIterator {
@@ -634,11 +631,10 @@ namespace ndd {
             float global_term_max;
 
             // SoA pointers
-            const void* doc_diffs_ptr = nullptr;  // Can be u16 or u32
-            const void* values_ptr = nullptr;
+            const uint16_t* doc_diffs_ptr = nullptr;
+            const uint8_t* values_ptr = nullptr;
             size_t block_data_size = 0;
-            uint8_t diff_bits = 32;
-            uint8_t value_bits = 8;
+            float block_scale = 0.0f;
 
             size_t current_entry_idx;
             ndd::idInt current_doc_id;
@@ -690,46 +686,25 @@ namespace ndd {
                 doc_diffs_ptr = view.doc_diffs;
                 values_ptr = view.values;
                 block_data_size = view.count;
-                diff_bits = view.diff_bits;
-                value_bits = view.value_bits;
+                block_scale = view.block_scale;
                 current_entry_idx = 0;
                 advanceToNextLive();
             }
 
-            inline float valueAt(size_t idx, float block_max_value) const {
-                if(value_bits == 32) {
-                    return static_cast<const float*>(values_ptr)[idx];
-                }
-                return dequantize(static_cast<const uint8_t*>(values_ptr)[idx], block_max_value);
+            inline float valueAt(size_t idx) const {
+                return dequantize(values_ptr[idx], block_scale);
             }
 
             inline bool isLiveAt(size_t idx) const {
-                if(value_bits == 32) {
-                    return static_cast<const float*>(values_ptr)[idx] > 0.0f;
-                }
-                return static_cast<const uint8_t*>(values_ptr)[idx] > 0;
+                return values_ptr[idx] != 0;
             }
 
             inline size_t findNextLive(size_t start_idx) const {
-                if(value_bits == 32) {
-                    size_t idx = start_idx;
-                    auto values = static_cast<const float*>(values_ptr);
-                    while(idx < block_data_size && values[idx] <= 0.0f) {
-                        ++idx;
-                    }
-                    return idx;
-                }
-                return index->findNextLiveSIMD(
-                        static_cast<const uint8_t*>(values_ptr), block_data_size, start_idx);
+                return index->findNextLiveSIMDU8(values_ptr, block_data_size, start_idx);
             }
 
             inline void advanceToNextLive() {
-                // Branch prediction will handle diff_bits effectively (constant per block)
-                if(diff_bits == 16) {
-                    advanceToNextLive16();
-                } else {
-                    advanceToNextLive32();
-                }
+                advanceToNextLive16();
             }
 
             inline void advanceToNextLive16() {
@@ -739,7 +714,7 @@ namespace ndd {
                 if(current_entry_idx < block_data_size && isLiveAt(current_entry_idx)) {
                     const auto& block_meta = (*blocks)[current_block_idx];
                     current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
-                    current_score = valueAt(current_entry_idx, block_meta.block_max_value);
+                    current_score = valueAt(current_entry_idx);
                     return;
                 }
 
@@ -748,7 +723,7 @@ namespace ndd {
                 if(current_entry_idx < block_data_size) {
                     const auto& block_meta = (*blocks)[current_block_idx];
                     current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
-                        current_score = valueAt(current_entry_idx, block_meta.block_max_value);
+                    current_score = valueAt(current_entry_idx);
                     return;
                 }
                 // Block exhausted
@@ -756,50 +731,9 @@ namespace ndd {
                 loadCurrentBlock();
             }
 
-            inline void advanceToNextLive32() {
-                if(current_entry_idx < block_data_size && isLiveAt(current_entry_idx)) {
-                    const auto& block_meta = (*blocks)[current_block_idx];
-                    if(diff_bits == 32) {
-                        auto diff_ptr = static_cast<const uint32_t*>(doc_diffs_ptr);
-                        current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
-                    }
-                    else {
-                        current_doc_id = std::numeric_limits<ndd::idInt>::max();
-                        current_block_idx = blocks->size();
-                        return;
-                    }
-                    current_score = valueAt(current_entry_idx, block_meta.block_max_value);
-                    return;
-                }
-
-                current_entry_idx = findNextLive(current_entry_idx);
-
-                if(current_entry_idx < block_data_size) {
-                    const auto& block_meta = (*blocks)[current_block_idx];
-                    if(diff_bits == 32) {
-                        auto diff_ptr = static_cast<const uint32_t*>(doc_diffs_ptr);
-                        current_doc_id = block_meta.start_doc_id + diff_ptr[current_entry_idx];
-                    }
-                    else {
-                        current_doc_id = std::numeric_limits<ndd::idInt>::max();
-                        current_block_idx = blocks->size();
-                        return;
-                    }
-                        current_score = valueAt(current_entry_idx, block_meta.block_max_value);
-                    return;
-                }
-                current_block_idx++;
-                loadCurrentBlock();
-            }
-
             inline void next() {
                 current_entry_idx++;
-                // Inline the check to avoid function call overhead in tight loops
-                if(diff_bits == 16) {
-                    advanceToNextLive16();
-                } else {
-                    advanceToNextLive32();
-                }
+                advanceToNextLive16();
             }
 
             void advance(ndd::idInt target_doc_id) {
@@ -807,20 +741,16 @@ namespace ndd {
                     return;
                 }
 
-                // Dispatch to specialized implementation
-                if(diff_bits == 16) {
-                    advance16(target_doc_id);
-                } else {
-                    advanceGeneric(target_doc_id);
-                }
+                advance16(target_doc_id);
             }
 
             // Specialized advance for 16-bit
             void advance16(ndd::idInt target_doc_id) {
-                // Optimize Block Skipping logic (Same as before)
                 if(current_block_idx < blocks->size()) {
-                    if(current_block_idx + 1 < blocks->size()
-                       && (*blocks)[current_block_idx + 1].start_doc_id < target_doc_id) {
+                    const auto& cur_block = (*blocks)[current_block_idx];
+                    ndd::idInt cur_block_end =
+                        cur_block.start_doc_id + cur_block.end_doc_id_diff;
+                    if(cur_block_end < target_doc_id) {
                         auto it = std::upper_bound(blocks->begin() + current_block_idx,
                                                    blocks->end(),
                                                    target_doc_id,
@@ -833,20 +763,14 @@ namespace ndd {
                             // Reset state for new block
                             current_entry_idx = 0;
                             doc_diffs_ptr = nullptr;
+                            values_ptr = nullptr;
                             block_data_size = 0;
-                            // DO NOT recursively call loadCurrentBlock -> advance(), just break to
-                            // reload below
                         }
                     }
                 }
 
                 if(block_data_size == 0) {
                     loadCurrentBlock();
-                    // If diff_bits changed (unlikely but possible), dispatch again
-                    if(diff_bits != 16) {
-                        advance(target_doc_id);
-                        return;
-                    }
                 }
 
                 if(current_block_idx >= blocks->size()) {
@@ -856,7 +780,6 @@ namespace ndd {
                 const auto& block_meta = (*blocks)[current_block_idx];
                 if(target_doc_id > block_meta.start_doc_id) {
                     ndd::idInt diff = target_doc_id - block_meta.start_doc_id;
-                    // If diff > UINT16_MAX, we know it's not in this 16-bit block
                     if(diff > UINT16_MAX) {
                         current_entry_idx = block_data_size;
                     } else {
@@ -867,52 +790,6 @@ namespace ndd {
                                 static_cast<uint16_t>(diff));
                     }
                     advanceToNextLive16();
-                }
-            }
-
-            // Specialized advance for non-16-bit blocks (32-bit or Generic)
-            void advanceGeneric(ndd::idInt target_doc_id) {
-                // Optimize Block Skipping logic
-                if(current_block_idx < blocks->size()) {
-                    if(current_block_idx + 1 < blocks->size()
-                       && (*blocks)[current_block_idx + 1].start_doc_id < target_doc_id) {
-                        auto it = std::upper_bound(blocks->begin() + current_block_idx,
-                                                   blocks->end(),
-                                                   target_doc_id,
-                                                   [](ndd::idInt id, const BlockIdx& b) {
-                                                       return id < b.start_doc_id;
-                                                   });
-                        size_t next_idx = std::distance(blocks->begin(), it);
-                        if(next_idx > 0) {
-                            current_block_idx = next_idx - 1;
-                            current_entry_idx = 0;
-                            doc_diffs_ptr = nullptr;
-                            block_data_size = 0;
-                        }
-                    }
-                }
-
-                if(block_data_size == 0) {
-                    loadCurrentBlock();
-                    if(diff_bits == 16) {
-                        advance(target_doc_id);
-                        return;
-                    }
-                }
-
-                if(current_block_idx >= blocks->size()) {
-                    return;
-                }
-
-                const auto& block_meta = (*blocks)[current_block_idx];
-                if(target_doc_id > block_meta.start_doc_id) {
-                    ndd::idInt diff = target_doc_id - block_meta.start_doc_id;
-                    current_entry_idx =
-                            index->findEntryIndexSIMD32(static_cast<const uint32_t*>(doc_diffs_ptr),
-                                                        block_data_size,
-                                                        current_entry_idx,
-                                                        static_cast<uint32_t>(diff));
-                    advanceToNextLive32();
                 }
             }
 
@@ -1123,17 +1000,19 @@ namespace ndd {
                                         static_cast<uint32_t>(target_diff));
         }
 
-        // Find next non-zero value (live entry)
-        size_t findNextLiveSIMD(const uint8_t* values, size_t size, size_t start_idx) {
+        // Find next live uint8 value (0 means tombstone/zero).
+        size_t findNextLiveSIMDU8(const uint8_t* values, size_t size, size_t start_idx) {
             size_t idx = start_idx;
+            const uint8_t dead = 0;
 
 #if defined(USE_AVX512)
             const size_t simd_width = 64;
-            __m512i zero_vec = _mm512_setzero_si512();
+            __m512i dead_vec = _mm512_set1_epi8(static_cast<char>(dead));
 
             while(idx + simd_width <= size) {
-                __m512i data_vec = _mm512_loadu_si512(values + idx);
-                __mmask64 mask = _mm512_cmpneq_epu8_mask(data_vec, zero_vec);
+                __m512i data_vec =
+                        _mm512_loadu_si512(reinterpret_cast<const void*>(values + idx));
+                __mmask64 mask = _mm512_cmpneq_epu8_mask(data_vec, dead_vec);
 
                 if(mask != 0) {
                     return idx + __builtin_ctzll(mask);
@@ -1142,35 +1021,33 @@ namespace ndd {
             }
 #elif defined(USE_AVX2)
             const size_t simd_width = 32;
-            __m256i zero_vec = _mm256_setzero_si256();
+            __m256i dead_vec = _mm256_set1_epi8(static_cast<char>(dead));
 
             while(idx + simd_width <= size) {
                 __m256i data_vec =
                         _mm256_loadu_si256(reinterpret_cast<const __m256i*>(values + idx));
-                __m256i cmp = _mm256_cmpeq_epi8(data_vec, zero_vec);
-                int mask = _mm256_movemask_epi8(cmp);  // 1 = zero, 0 = non-zero
+                __m256i cmp = _mm256_cmpeq_epi8(data_vec, dead_vec);
+                int mask = _mm256_movemask_epi8(cmp);  // 1 = dead, 0 = live
 
-                // If all 1s (mask 0xFFFFFFFF), then all zeros -> continue
+                // If all 1s (mask 0xFFFFFFFF), then all dead -> continue
                 if(static_cast<uint32_t>(mask) != 0xFFFFFFFF) {
-                    // ~mask has 1s where non-zero exists
+                    // ~mask has 1s where live entries exist
                     return idx + __builtin_ctz(~mask);
                 }
                 idx += simd_width;
             }
 #elif defined(USE_NEON)
             const size_t simd_width = 16;
-            uint8x16_t zero_vec = vdupq_n_u8(0);
+            uint8x16_t dead_vec = vdupq_n_u8(dead);
 
             while(idx + simd_width <= size) {
                 uint8x16_t data_vec = vld1q_u8(values + idx);
-                uint8x16_t cmp = vceqq_u8(data_vec, zero_vec);
+                uint8x16_t cmp = vceqq_u8(data_vec, dead_vec);
 
-                // Check if any element is NOT zero (cmp is 0x00 for non-zero, 0xFF for zero)
-                // If all are zero, cmp is all 0xFF. vminvq_u8 will be 0xFF.
-                // If any is non-zero, cmp has a 0x00. vminvq_u8 will be 0x00.
+                // cmp is 0xFF for dead and 0x00 for live.
                 if(vminvq_u8(cmp) == 0) {
                     for(size_t i = 0; i < simd_width; ++i) {
-                        if(values[idx + i] != 0) {
+                        if(values[idx + i] != dead) {
                             return idx + i;
                         }
                     }
@@ -1181,7 +1058,7 @@ namespace ndd {
             svbool_t pg = svwhilelt_b8(idx, size);
             while(svptest_any(svptrue_b8(), pg)) {
                 svuint8_t data_vec = svld1_u8(pg, values + idx);
-                svbool_t cmp = svcmpne_n_u8(pg, data_vec, 0);  // Not equal to 0
+                svbool_t cmp = svcmpne_n_u8(pg, data_vec, dead);
 
                 if(svptest_any(pg, cmp)) {
                     svbool_t before_match = svbrkb_z(pg, cmp);
@@ -1194,7 +1071,7 @@ namespace ndd {
 #endif
 
             while(idx < size) {
-                if(values[idx] != 0) {
+                if(values[idx] != dead) {
                     return idx;
                 }
                 idx++;
@@ -1202,49 +1079,57 @@ namespace ndd {
             return idx;
         }
 
-        bool loadTermBlocksIndex() {
-            MDBX_txn* txn;
-            int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-            if(rc != 0) {
-                LOG_ERROR("Failed to begin transaction for loading index: " << mdbx_strerror(rc));
+        bool loadTermIndexForTerm(MDBX_txn* txn, uint32_t term_id, std::vector<BlockIdx>& blocks) const {
+            blocks.clear();
+
+            MDBX_val key;
+            key.iov_base = const_cast<void*>(static_cast<const void*>(&term_id));
+            key.iov_len = sizeof(uint32_t);
+
+            MDBX_val data;
+            int rc = mdbx_get(txn, term_blocks_index_dbi_, &key, &data);
+            if(rc == MDBX_NOTFOUND) {
+                return true;
+            }
+            if(rc != MDBX_SUCCESS) {
+                LOG_ERROR("Failed to load term index for term " << term_id << ": "
+                                                                 << mdbx_strerror(rc));
                 return false;
             }
 
-            MDBX_cursor* cursor;
-            rc = mdbx_cursor_open(txn, term_blocks_index_dbi_, &cursor);
-            if(rc != 0) {
-                mdbx_txn_abort(txn);
-                return false;
-            }
+            if((data.iov_len % sizeof(BlockIdx)) == 0) {
+                size_t count = data.iov_len / sizeof(BlockIdx);
+                blocks.resize(count);
+                std::memcpy(blocks.data(), data.iov_base, data.iov_len);
+            } else {
+                struct LegacyBlockIdx {
+                    ndd::idInt start_doc_id;
+                    float block_max_value;
+                };
 
-            MDBX_val key, data;
-            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_FIRST);
-            while(rc == MDBX_SUCCESS) {
-                if(key.iov_len == sizeof(uint32_t)) {
-                    uint32_t term_id;
-                    std::memcpy(&term_id, key.iov_base, sizeof(uint32_t));
-
-                    size_t count = data.iov_len / sizeof(BlockIdx);
-                    std::vector<BlockIdx> blocks(count);
-                    std::memcpy(blocks.data(), data.iov_base, data.iov_len);
-
-                    if(!blocks.empty()
-                       && blocks.front().start_doc_id != GLOBAL_MAX_SENTINEL_DOC_ID) {
-                        float global_max = 0.0f;
-                        for(const auto& b : blocks) {
-                            global_max = std::max(global_max, b.block_max_value);
-                        }
-                        blocks.insert(
-                                blocks.begin(), BlockIdx(GLOBAL_MAX_SENTINEL_DOC_ID, global_max));
-                    }
-
-                    term_blocks_index_[term_id] = std::move(blocks);
+                if((data.iov_len % sizeof(LegacyBlockIdx)) != 0) {
+                    return false;
                 }
-                rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+
+                size_t count = data.iov_len / sizeof(LegacyBlockIdx);
+                const auto* legacy = static_cast<const LegacyBlockIdx*>(data.iov_base);
+                blocks.reserve(count);
+                for(size_t i = 0; i < count; ++i) {
+                    blocks.emplace_back(
+                            legacy[i].start_doc_id,
+                            legacy[i].block_max_value,
+                            std::numeric_limits<uint16_t>::max());
+                }
             }
 
-            mdbx_cursor_close(cursor);
-            mdbx_txn_abort(txn);
+            if(!blocks.empty() && blocks.front().start_doc_id != GLOBAL_MAX_SENTINEL_DOC_ID) {
+                float global_max = 0.0f;
+                for(const auto& b : blocks) {
+                    global_max = std::max(global_max, b.block_max_value);
+                }
+                blocks.insert(blocks.begin(), BlockIdx(GLOBAL_MAX_SENTINEL_DOC_ID, global_max));
+            }
+
             return true;
         }
 
@@ -1362,61 +1247,29 @@ namespace ndd {
             int rc = mdbx_get(txn, term_blocks_dbi_, &key, &data);
 
             std::vector<BlockEntry> entries;
-            if(rc == MDBX_SUCCESS && data.iov_len >= sizeof(BlockHeader)) {
-                const BlockHeader* header = reinterpret_cast<const BlockHeader*>(data.iov_base);
-                size_t n = header->n;
+            if(rc == MDBX_SUCCESS && data.iov_len > 0) {
+                if(data.iov_len < sizeof(BlockHeader)) {
+                    return entries;
+                }
 
+                const BlockHeader* header = reinterpret_cast<const BlockHeader*>(data.iov_base);
+                const size_t payload_size = data.iov_len - sizeof(BlockHeader);
+                if(payload_size % BlockHeader::ENTRY_SIZE != 0) {
+                    return entries;
+                }
+
+                const size_t n = payload_size / BlockHeader::ENTRY_SIZE;
                 entries.resize(n);
+
                 const uint8_t* ptr =
                         static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader);
+                const uint16_t* diffs = reinterpret_cast<const uint16_t*>(ptr);
+                const uint8_t* vals = reinterpret_cast<const uint8_t*>(
+                        ptr + n * sizeof(uint16_t));
 
-                if(header->version == 3) {
-                    // Determine pointer locations based on diff_bits
-                    const void* diff_ptr = ptr;
-                    const uint8_t* val_ptr;
-
-                    if(header->diff_bits == 16) {
-                        val_ptr = ptr + n * sizeof(uint16_t);
-                        const uint16_t* diffs = static_cast<const uint16_t*>(diff_ptr);
-                        for(size_t i = 0; i < n; ++i) {
-                            entries[i].doc_diff = diffs[i];
-                            entries[i].value = dequantize(val_ptr[i], header->block_max_value);
-                        }
-                    } else if(header->diff_bits == 32) {
-                        val_ptr = ptr + n * sizeof(uint32_t);
-                        const uint32_t* diffs = static_cast<const uint32_t*>(diff_ptr);
-                        for(size_t i = 0; i < n; ++i) {
-                            entries[i].doc_diff = diffs[i];
-                            entries[i].value = dequantize(val_ptr[i], header->block_max_value);
-                        }
-                    }
-                    else {
-                        LOG_ERROR("Unsupported block diff_bits: " << (int)header->diff_bits);
-                    }
-                } else if(header->version == 4) {
-                    const void* diff_ptr = ptr;
-                    const float* val_ptr;
-
-                    if(header->diff_bits == 16) {
-                        val_ptr = reinterpret_cast<const float*>(ptr + n * sizeof(uint16_t));
-                        const uint16_t* diffs = static_cast<const uint16_t*>(diff_ptr);
-                        for(size_t i = 0; i < n; ++i) {
-                            entries[i].doc_diff = diffs[i];
-                            entries[i].value = val_ptr[i];
-                        }
-                    } else if(header->diff_bits == 32) {
-                        val_ptr = reinterpret_cast<const float*>(ptr + n * sizeof(uint32_t));
-                        const uint32_t* diffs = static_cast<const uint32_t*>(diff_ptr);
-                        for(size_t i = 0; i < n; ++i) {
-                            entries[i].doc_diff = diffs[i];
-                            entries[i].value = val_ptr[i];
-                        }
-                    }
-                    else {
-                        LOG_ERROR("Unsupported block diff_bits: " << (int)header->diff_bits);
-                    }
-                } else {
-                    LOG_ERROR("Unsupported block version: " << (int)header->version);
+                for(size_t i = 0; i < n; ++i) {
+                    entries[i].doc_diff = diffs[i];
+                    entries[i].value = dequantize(vals[i], header->block_scale);
                 }
             }
             return entries;
@@ -1443,45 +1296,24 @@ namespace ndd {
 
             // Recalculate stats
             float max_val = 0.0f;
-            ndd::idInt max_diff = 0;
             size_t live = 0;
 
             for(const auto& e : entries) {
                 if(e.value > max_val) {
                     max_val = e.value;
                 }
-                if(e.doc_diff > max_diff) {
-                    max_diff = e.doc_diff;
-                }
                 if(e.value > 1e-9f) {
                     live++;  // Approximate check for float > 0
                 }
             }
 
-            header.block_max_value = max_val;
+            header.version = CURRENT_VERSION;
+            header.params = 0;
             header.live_count = static_cast<uint16_t>(live);
-            header.n = static_cast<uint16_t>(n);
-            
-#if defined(NDD_BMW_STORE_FLOAT_VALUES)
-            header.version = 4;
-#else
-            header.version = 3;
-#endif
-            header.alignment_pad = 0;
+            header.block_scale =
+                    (max_val <= settings::NEAR_ZERO) ? 0.0f : (max_val / UINT8_MAX);
 
-            if(max_diff <= UINT16_MAX) {
-                header.diff_bits = 16;
-            } else {
-                header.diff_bits = 32;
-            }
-
-            size_t diff_size = header.diff_bits / 8;
-#if defined(NDD_BMW_STORE_FLOAT_VALUES)
-            size_t value_size = sizeof(float);
-#else
-            size_t value_size = sizeof(uint8_t);
-#endif
-            size_t total_size = sizeof(BlockHeader) + (n * diff_size) + (n * value_size);
+            size_t total_size = sizeof(BlockHeader) + (n * BlockHeader::ENTRY_SIZE);
 
             std::vector<uint8_t> buffer(total_size);
 
@@ -1491,32 +1323,17 @@ namespace ndd {
             uint8_t* ptr = buffer.data() + sizeof(BlockHeader);
 
             // Copy doc_diffs
-            if(header.diff_bits == 16) {
-                uint16_t* diffs = reinterpret_cast<uint16_t*>(ptr);
-                for(size_t i = 0; i < n; ++i) {
-                    diffs[i] = static_cast<uint16_t>(entries[i].doc_diff);
-                }
-                ptr += n * sizeof(uint16_t);
-            } else if(header.diff_bits == 32) {
-                uint32_t* diffs = reinterpret_cast<uint32_t*>(ptr);
-                for(size_t i = 0; i < n; ++i) {
-                    diffs[i] = static_cast<uint32_t>(entries[i].doc_diff);
-                }
-                ptr += n * sizeof(uint32_t);
+            uint16_t* diffs = reinterpret_cast<uint16_t*>(ptr);
+            for(size_t i = 0; i < n; ++i) {
+                diffs[i] = entries[i].doc_diff;
             }
+            ptr += n * sizeof(uint16_t);
 
-            // Copy values
-#if defined(NDD_BMW_STORE_FLOAT_VALUES)
-            float* values = reinterpret_cast<float*>(ptr);
+            // Copy uint8 values
+            uint8_t* values = reinterpret_cast<uint8_t*>(ptr);
             for(size_t i = 0; i < n; ++i) {
-                values[i] = entries[i].value;
+                values[i] = quantize(entries[i].value, header.block_scale);
             }
-#else
-            uint8_t* values = static_cast<uint8_t*>(ptr);
-            for(size_t i = 0; i < n; ++i) {
-                values[i] = quantize(entries[i].value, max_val);
-            }
-#endif
 
             MDBX_val data;
             data.iov_base = buffer.data();
@@ -1601,7 +1418,8 @@ namespace ndd {
             }
 
             blocks[block_idx].start_doc_id = new_start_doc_id;
-            blocks[block_idx].block_max_value = header.block_max_value;
+            blocks[block_idx].block_max_value = blockMaxFromScale(header.block_scale);
+            blocks[block_idx].end_doc_id_diff = live_entries.back().doc_diff;
 
             return true;
         }
@@ -1626,47 +1444,42 @@ namespace ndd {
             if(rc == MDBX_SUCCESS && data.iov_len >= sizeof(BlockHeader)) {
                 const BlockHeader* header = reinterpret_cast<const BlockHeader*>(data.iov_base);
 
-                size_t diff_size = 0;
-                if(header->diff_bits == 16) {
-                    diff_size = sizeof(uint16_t);
-                } else if(header->diff_bits == 32) {
-                    diff_size = sizeof(uint32_t);
-                }
-                else {
-                    return {nullptr, nullptr, 0, 0, 0};
+                const size_t payload_size = data.iov_len - sizeof(BlockHeader);
+                if(payload_size % BlockHeader::ENTRY_SIZE != 0) {
+                    return {nullptr, nullptr, 0, 0.0f};
                 }
 
-                size_t value_size = (header->version == 4) ? sizeof(float) : sizeof(uint8_t);
-                size_t required_size = sizeof(BlockHeader) + header->n * diff_size + header->n * value_size;
-                if(data.iov_len < required_size) {
-                    return {nullptr, nullptr, 0, 0, 0};
-                }
-
+                const size_t n = payload_size / BlockHeader::ENTRY_SIZE;
                 const uint8_t* ptr =
                         static_cast<const uint8_t*>(data.iov_base) + sizeof(BlockHeader);
 
-                const void* doc_diffs = ptr;
-                const uint8_t* values = ptr + header->n * diff_size;
+                const uint16_t* doc_diffs = reinterpret_cast<const uint16_t*>(ptr);
+                const uint8_t* values =
+                    reinterpret_cast<const uint8_t*>(ptr + n * sizeof(uint16_t));
 
-                return {doc_diffs,
-                        values,
-                        header->n,
-                        header->diff_bits,
-                        static_cast<uint8_t>((header->version == 4) ? 32 : 8)};
+                return {doc_diffs, values, n, header->block_scale};
             }
-            return {nullptr, nullptr, 0, 0, 0};
+            return {nullptr, nullptr, 0, 0.0f};
         }
 
         ndd::idInt getBlockEndDocId(const std::vector<BlockIdx>& blocks, size_t block_idx) const {
-            if(block_idx + 1 < blocks.size()) {
-                return blocks[block_idx + 1].start_doc_id - 1;
+            if(block_idx < blocks.size()) {
+                return blocks[block_idx].start_doc_id + blocks[block_idx].end_doc_id_diff;
             }
             return std::numeric_limits<ndd::idInt>::max();
         }
 
         bool addToBlock(MDBX_txn* txn, uint32_t term_id, ndd::idInt doc_id, float value) {
-            // Get or create blocks for this term
-            auto& blocks = term_blocks_index_[term_id];
+            // Get or create blocks for this term (lazy load from MDBX if absent in RAM)
+            auto term_it = term_blocks_index_.find(term_id);
+            if(term_it == term_blocks_index_.end()) {
+                std::vector<BlockIdx> loaded;
+                if(!loadTermIndexForTerm(txn, term_id, loaded)) {
+                    return false;
+                }
+                term_it = term_blocks_index_.emplace(term_id, std::move(loaded)).first;
+            }
+            auto& blocks = term_it->second;
 
             // Find the appropriate block
             auto block_it = findBlockIterator(blocks, doc_id);
@@ -1696,7 +1509,7 @@ namespace ndd {
                     insert_it = block_it;
                 }
 
-                blocks.insert(insert_it, BlockIdx(doc_id, value));
+                blocks.insert(insert_it, BlockIdx(doc_id, value, 0));
 
                 // Create the actual block data
                 std::vector<BlockEntry> entries;
@@ -1712,17 +1525,22 @@ namespace ndd {
             auto block_entries = loadBlock(txn, term_id, block_it->start_doc_id);
 
             ndd::idInt doc_diff = doc_id - block_it->start_doc_id;
+                if(doc_diff > UINT16_MAX) {
+                return false;
+                }
 
             // Find insertion point (keep sorted by doc_diff)
             auto entry_it = std::lower_bound(
-                    block_entries.begin(), block_entries.end(), BlockEntry(doc_diff, 0.0f));
+                    block_entries.begin(),
+                    block_entries.end(),
+                    BlockEntry(static_cast<uint16_t>(doc_diff), 0.0f));
 
             if(entry_it != block_entries.end() && entry_it->doc_diff == doc_diff) {
                 // Update existing entry
                 entry_it->value = value;
             } else {
                 // Insert new entry
-                block_entries.insert(entry_it, BlockEntry(doc_diff, value));
+                block_entries.insert(entry_it, BlockEntry(static_cast<uint16_t>(doc_diff), value));
             }
 
             // Check if block needs splitting
@@ -1732,7 +1550,8 @@ namespace ndd {
                 if(!saved) {
                     return false;
                 }
-                block_it->block_max_value = header.block_max_value;
+                block_it->block_max_value = blockMaxFromScale(header.block_scale);
+                block_it->end_doc_id_diff = block_entries.back().doc_diff;
                 return splitBlock(txn, term_id, block_it->start_doc_id);
             }
 
@@ -1742,13 +1561,25 @@ namespace ndd {
             bool success = saveBlock(txn, term_id, block_it->start_doc_id, block_entries, header);
             if(success) {
                 // Keep cached block max synchronized (increase or decrease).
-                block_it->block_max_value = header.block_max_value;
+                block_it->block_max_value = blockMaxFromScale(header.block_scale);
+                block_it->end_doc_id_diff = block_entries.back().doc_diff;
             }
             return success;
         }
 
         bool removeFromBlock(MDBX_txn* txn, uint32_t term_id, ndd::idInt doc_id) {
             auto it = term_blocks_index_.find(term_id);
+            if(it == term_blocks_index_.end()) {
+                std::vector<BlockIdx> loaded;
+                if(!loadTermIndexForTerm(txn, term_id, loaded)) {
+                    return false;
+                }
+                if(loaded.empty()) {
+                    return false;
+                }
+                it = term_blocks_index_.emplace(term_id, std::move(loaded)).first;
+            }
+
             if(it == term_blocks_index_.end()) {
                 return false;  // Term not found
             }
@@ -1770,9 +1601,14 @@ namespace ndd {
             auto block_entries = loadBlock(txn, term_id, block_it->start_doc_id);
             size_t block_idx = std::distance(blocks.begin(), block_it);
             ndd::idInt doc_diff = doc_id - block_it->start_doc_id;
+                if(doc_diff > UINT16_MAX) {
+                return false;
+                }
 
             auto entry_it = std::lower_bound(
-                    block_entries.begin(), block_entries.end(), BlockEntry(doc_diff, 0.0f));
+                    block_entries.begin(),
+                    block_entries.end(),
+                    BlockEntry(static_cast<uint16_t>(doc_diff), 0.0f));
 
             if(entry_it != block_entries.end() && entry_it->doc_diff == doc_diff) {
                 entry_it->value = 0.0f;  // Mark as tombstone (0.0f)
@@ -1781,7 +1617,8 @@ namespace ndd {
                 // Fields set by saveBlock
                 bool success = saveBlock(txn, term_id, block_it->start_doc_id, block_entries, header);
                 if(success) {
-                    block_it->block_max_value = header.block_max_value;
+                    block_it->block_max_value = blockMaxFromScale(header.block_scale);
+                    block_it->end_doc_id_diff = block_entries.back().doc_diff;
 
                     // Deterministic 1/8 compaction trigger to avoid extra RNG overhead.
                     if((doc_id % 8) == 0) {
