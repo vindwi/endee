@@ -589,26 +589,17 @@ namespace ndd {
          * XXX: Here we are assuming that sparse vectors can never have -ve values.
          */
         // Quantize to uint8. 0 is reserved as tombstone.
+
         static inline uint8_t quantize(float val, float block_scale) {
             if(block_scale <= settings::NEAR_ZERO || val <= 0.0f) {
                 return 0;
             }
 
-            float qf = val / block_scale;
-            if(qf >= UINT8_MAX) {
-                qf = UINT8_MAX;
-            }
-            if(qf < 1.0f) {
-                qf = 1.0f;
-            }
+            float qf = val / block_scale;            
             return static_cast<uint8_t>(qf + 0.5f);
         }
 
         static inline float dequantize(uint8_t val, float block_scale) {
-            if(block_scale <= settings::NEAR_ZERO) {
-                return 0.0f;
-            }
-
             return static_cast<float>(val) * block_scale;
         }
 
@@ -1690,7 +1681,7 @@ namespace ndd {
 
             // Logic similar to addToBlock. Load, modify, Save.
             // We do basic range check to avoid loading obviously wrong block
-            if((doc_id - block_it->start_doc_id) > 200000) {  // Safety heuristic
+            if((doc_id - block_it->start_doc_id) > UINT16_MAX) {  // Safety heuristic
                 return false;
             }
 
