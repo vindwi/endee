@@ -340,7 +340,7 @@ namespace ndd {
                     return;
                 }
 
-                // Requested bubble sort for iterator ordering by current doc id.
+                // Bubble sort with early exit — O(n) on nearly-sorted arrays.
                 bool swapped;
                 for(size_t pass = 0; pass + 1 < iterators.size(); ++pass) {
                     swapped = false;
@@ -354,6 +354,21 @@ namespace ndd {
                         break;
                     }
                 }
+            };
+
+            // Fast path: only iterators[0] was modified and moved forward.
+            // Shift it rightward to its correct sorted position in one pass.
+            auto reposition_first = [&]() {
+                const size_t n = iterators.size();
+                if(n < 2) return;
+                BlockIterator* moved = iterators[0];
+                ndd::idInt doc = moved->current_doc_id;
+                size_t j = 0;
+                while(j + 1 < n && iterators[j + 1]->current_doc_id < doc) {
+                    iterators[j] = iterators[j + 1];
+                    ++j;
+                }
+                iterators[j] = moved;
             };
 
             sort_iterators();
@@ -446,6 +461,8 @@ namespace ndd {
                 } else {
                     // Standard WAND/BMW behavior: advance only the first iterator to the pivot.
                     iterators[0]->advance(pivot_doc_id);
+                    reposition_first();
+                    continue;
                 }
                 sort_iterators();
             }
