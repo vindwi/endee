@@ -435,15 +435,15 @@ namespace ndd {
                     }
 
                     // Pivot is the first iterator, so we have a candidate
-                    iterators[0]->advance(pivot_doc_id);  // Should be no-op
-                    float score = iterators[0]->current_score * iterators[0]->term_weight;
+                    // current_score already has term_weight baked in via weighted_block_scale
+                    float score = iterators[0]->current_score;
                     iterators[0]->next();
 
                     // Check other terms
                     for(size_t i = 1; i < iterators.size(); ++i) {
                         iterators[i]->advance(pivot_doc_id);
                         if(iterators[i]->current_doc_id == pivot_doc_id) {
-                            score += iterators[i]->current_score * iterators[i]->term_weight;
+                            score += iterators[i]->current_score;
                             iterators[i]->next();
                         }
                     }
@@ -685,6 +685,11 @@ namespace ndd {
             size_t block_data_size = 0;
             float block_scale = 0.0f;
 
+            // Cached from blocks[current_block_idx] to avoid indexed load in hot path
+            ndd::idInt block_start_doc_id = 0;
+            // Pre-multiplied: block_scale * term_weight (avoids multiply in scoring)
+            float weighted_block_scale = 0.0f;
+
             size_t current_entry_idx;
             ndd::idInt current_doc_id;
             float current_score;
@@ -746,16 +751,10 @@ namespace ndd {
                 entries_ptr = view.entries;
                 block_data_size = view.count;
                 block_scale = view.block_scale;
+                block_start_doc_id = blocks[current_block_idx].start_doc_id;
+                weighted_block_scale = block_scale * term_weight;
                 current_entry_idx = 0;
                 advanceToNextLive();
-            }
-
-            inline float valueAt(size_t idx) const {
-                return dequantize(entries_ptr[idx].value, block_scale);
-            }
-
-            inline bool isLiveAt(size_t idx) const {
-                return entries_ptr[idx].value != 0;
             }
 
             inline void advanceToNextLive() {
@@ -763,20 +762,22 @@ namespace ndd {
             }
 
             inline void advanceToNextLiveAoS() {
-                // Fast path: check if current entry is already live
-                if(current_entry_idx < block_data_size && isLiveAt(current_entry_idx)) {
-                    const auto& block_meta = blocks[current_block_idx];
-                    current_doc_id = block_meta.start_doc_id + entries_ptr[current_entry_idx].doc_diff;
-                    current_score = valueAt(current_entry_idx);
-                    return;
+                // Fast path: read entry once, check if live
+                if(current_entry_idx < block_data_size) {
+                    const AoSEntry& e = entries_ptr[current_entry_idx];
+                    if(e.value != 0) {
+                        current_doc_id = block_start_doc_id + e.doc_diff;
+                        current_score = static_cast<float>(e.value) * weighted_block_scale;
+                        return;
+                    }
                 }
 
                 // Scan AoS entries for next live entry
                 while(current_entry_idx < block_data_size) {
-                    if(entries_ptr[current_entry_idx].value != 0) {
-                        const auto& block_meta = blocks[current_block_idx];
-                        current_doc_id = block_meta.start_doc_id + entries_ptr[current_entry_idx].doc_diff;
-                        current_score = valueAt(current_entry_idx);
+                    const AoSEntry& e = entries_ptr[current_entry_idx];
+                    if(e.value != 0) {
+                        current_doc_id = block_start_doc_id + e.doc_diff;
+                        current_score = static_cast<float>(e.value) * weighted_block_scale;
                         return;
                     }
                     current_entry_idx++;
@@ -803,9 +804,8 @@ namespace ndd {
             // Advance to target doc_id using AoS entries
             void advanceAoS(ndd::idInt target_doc_id) {
                 if(current_block_idx < blocks_count) {
-                    const auto& cur_block = blocks[current_block_idx];
                     ndd::idInt cur_block_end =
-                        cur_block.start_doc_id + cur_block.end_doc_id_diff;
+                        block_start_doc_id + blocks[current_block_idx].end_doc_id_diff;
                     if(cur_block_end < target_doc_id) {
                         const BlockIdx* begin = blocks + current_block_idx;
                         const BlockIdx* end = blocks + blocks_count;
@@ -834,9 +834,8 @@ namespace ndd {
                     return;
                 }
 
-                const auto& block_meta = blocks[current_block_idx];
-                if(target_doc_id > block_meta.start_doc_id) {
-                    ndd::idInt diff = target_doc_id - block_meta.start_doc_id;
+                if(target_doc_id > block_start_doc_id) {
+                    ndd::idInt diff = target_doc_id - block_start_doc_id;
                     if(diff > UINT16_MAX) {
                         current_entry_idx = block_data_size;
                     } else {
