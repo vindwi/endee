@@ -432,8 +432,22 @@ namespace ndd {
                 }
 
                 if(!found_pivot) {
-                    // No document can exceed threshold
-                    break;
+                    // BMW block-max skip: current block-max bounds can't beat
+                    // threshold, but later blocks may. Find the earliest
+                    // block-end across all iterators and advance everything
+                    // past it. This is the core BMW optimization over WAND.
+                    ndd::idInt min_block_end = iterators[0]->blockEndDocId();
+                    for(size_t i = 1; i < iterators.size(); ++i) {
+                        ndd::idInt be = iterators[i]->blockEndDocId();
+                        if(be < min_block_end) min_block_end = be;
+                    }
+                    // Advance all iterators past min_block_end
+                    ndd::idInt skip_to = min_block_end + 1;
+                    for(size_t i = 0; i < iterators.size(); ++i) {
+                        iterators[i]->advance(skip_to);
+                    }
+                    sort_iterators();
+                    continue;
                 }
 
                 ndd::idInt pivot_doc_id = iterators[pivot_idx]->current_doc_id;
@@ -458,8 +472,19 @@ namespace ndd {
                     float score = iterators[0]->current_score;
                     iterators[0]->next();
 
-                    // Check other terms
+                    // Check other terms with early termination:
+                    // accumulate remaining upper bounds and bail if we can't beat threshold
+                    float remaining_ub = 0.0f;
                     for(size_t i = 1; i < iterators.size(); ++i) {
+                        remaining_ub += iterators[i]->upperBound();
+                    }
+
+                    for(size_t i = 1; i < iterators.size(); ++i) {
+                        remaining_ub -= iterators[i]->upperBound();
+                        if(top_k.size() >= k && score + remaining_ub + iterators[i]->upperBound() <= threshold) {
+                            // Can't beat threshold even with all remaining terms at max
+                            break;
+                        }
                         iterators[i]->advance(pivot_doc_id);
                         if(iterators[i]->current_doc_id == pivot_doc_id) {
                             score += iterators[i]->current_score;
@@ -826,7 +851,14 @@ namespace ndd {
                     ndd::idInt cur_block_end =
                         block_start_doc_id + blocks[current_block_idx].end_doc_id_diff;
                     if(cur_block_end < target_doc_id) {
-                        const BlockIdx* begin = blocks + current_block_idx;
+                        // Start search AFTER current block — we know it ends before target
+                        size_t search_start = current_block_idx + 1;
+                        if(search_start >= blocks_count) {
+                            current_block_idx = blocks_count;
+                            current_doc_id = std::numeric_limits<ndd::idInt>::max();
+                            return;
+                        }
+                        const BlockIdx* begin = blocks + search_start;
                         const BlockIdx* end = blocks + blocks_count;
                         auto it = std::upper_bound(begin,
                                                    end,
@@ -834,14 +866,15 @@ namespace ndd {
                                                    [](ndd::idInt id, const BlockIdx& b) {
                                                        return id < b.start_doc_id;
                                                    });
-                        size_t next_idx = static_cast<size_t>(it - blocks);
-                        if(next_idx > 0) {
-                            current_block_idx = next_idx - 1;
-                            // Reset state for new block
-                            current_entry_idx = 0;
-                            entries_ptr = nullptr;
-                            block_data_size = 0;
+                        if(it != begin) {
+                            current_block_idx = static_cast<size_t>((it - 1) - blocks);
+                        } else {
+                            // All remaining blocks start after target
+                            current_block_idx = search_start;
                         }
+                        current_entry_idx = 0;
+                        entries_ptr = nullptr;
+                        block_data_size = 0;
                     }
                 }
 
@@ -877,6 +910,14 @@ namespace ndd {
             }
 
             float globalUpperBound() const { return term_weight * global_term_max; }
+
+            ndd::idInt blockEndDocId() const {
+                if(current_block_idx >= blocks_count) {
+                    return std::numeric_limits<ndd::idInt>::max();
+                }
+                return blocks[current_block_idx].start_doc_id
+                     + blocks[current_block_idx].end_doc_id_diff;
+            }
         };
 
         MDBX_env* env_;
