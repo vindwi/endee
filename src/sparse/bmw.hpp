@@ -274,9 +274,11 @@ namespace ndd {
         }
 
         // Search using BMW algorithm (DAAT
+        // prune_frac: fraction of lowest-weight query terms to drop (0.0 = keep all, 0.25 = drop bottom 25%)
         std::vector<std::pair<ndd::idInt, float>> search(const SparseVector& query,
                                                         size_t k,
-                                                        const ndd::RoaringBitmap* filter = nullptr)
+                                                        const ndd::RoaringBitmap* filter = nullptr,
+                                                        float prune_frac = 0.0f)
         {
             if(query.empty() || k == 0) {
                 return {};
@@ -305,7 +307,24 @@ namespace ndd {
             std::vector<BlockIterator*> iterators;
             iterators.reserve(query.indices.size());
 
-            for(size_t i = 0; i < query.indices.size(); ++i) {
+            // Optionally prune lowest-weight query terms for speed
+            size_t query_size = query.indices.size();
+            size_t keep_count = query_size;
+            std::vector<size_t> term_order;
+
+            if(prune_frac > 0.0f && query_size > 1) {
+                term_order.resize(query_size);
+                for(size_t i = 0; i < query_size; ++i) term_order[i] = i;
+                std::sort(term_order.begin(), term_order.end(), [&](size_t a, size_t b) {
+                    return std::abs(query.values[a]) > std::abs(query.values[b]);
+                });
+                keep_count = query_size - static_cast<size_t>(query_size * prune_frac);
+                if(keep_count == 0) keep_count = 1;
+                term_order.resize(keep_count);
+            }
+
+            for(size_t ti = 0; ti < keep_count; ++ti) {
+                size_t i = term_order.empty() ? ti : term_order[ti];
                 TermBlocksView blocks_view;
                 if(loadTermIndexViewForTerm(txn, query.indices[i], blocks_view)
                    && blocks_view.size > 0) {
