@@ -28,6 +28,7 @@ namespace ndd {
             FP32 = 32,   // Full precision float (4 bytes per dimension)
             INT16 = 16,  // Dynamic 16-bit integer quantization
             FP16 = 15,   // Half precision float (2 bytes per dimension)
+            INT8E = 9,   // Dynamic 8-bit integer quantization with floor + correction
             BINARY = 1,  // Binary quantization (1 bit per dimension)
             INT8 = 8,    // Dynamic 8-bit integer quantization
             UNKNOWN = 0

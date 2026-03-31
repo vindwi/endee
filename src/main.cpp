@@ -405,6 +405,10 @@ int main(int argc, char** argv) {
                     precision = "int8";
                 } else if(precision == "int16d") {
                     precision = "int16";
+                } else if(precision == "in8e") {
+                    precision = "int8e";
+                } else if(precision == "binary") {
+                    precision = "int8e";
                 }
 
                 ndd::quant::QuantizationLevel quant_level = stringToQuantLevel(precision);
