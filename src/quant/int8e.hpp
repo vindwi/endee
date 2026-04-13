@@ -202,7 +202,7 @@ namespace ndd {
                 }
 
                 const float base = static_cast<float>(dot) * scale1 * scale2;
-                const float correction = 0.5f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
+                const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
                                          scale1 * scale2;
                 return base + correction;
             }
