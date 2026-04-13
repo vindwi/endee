@@ -54,8 +54,9 @@ namespace ndd {
                                                        sign_bytes);
             }
 
-            // Quantize with nearest rounding and store sign(roundoff) bits:
-            // 0 for negative error, 1 for non-negative error.
+            // Quantize with nearest rounding and store sign(residual) bits,
+            // where residual = real - rounded:
+            // 0 for negative residual, 1 for non-negative residual.
             inline std::vector<uint8_t>
             quantize_vector_fp32_to_int8_buffer(const std::vector<float>& input) {
                 if(input.empty()) {
@@ -89,8 +90,8 @@ namespace ndd {
                     float clamped = std::max(-127.0f, std::min(127.0f, scaled));
                     data_ptr[i] = static_cast<int8_t>(clamped);
 
-                    const float roundoff = clamped - scaled_real;
-                    if(roundoff >= 0.0f) {
+                    const float residual = scaled_real - clamped;
+                    if(residual >= 0.0f) {
                         const size_t word = i >> 6;
                         const size_t bit = i & 63;
                         sign_words[word] |= (1ULL << bit);
@@ -167,14 +168,18 @@ namespace ndd {
                 const uint64_t* bits2 = extract_sign_words((const uint8_t*)pVect2, qty);
 
                 int64_t dot = 0;
+                int64_t sum_xi = 0;
+                int64_t sum_yi = 0;
                 for(size_t i = 0; i < qty; ++i) {
                     const int32_t a = static_cast<int32_t>(pVect1[i]);
                     const int32_t b = static_cast<int32_t>(pVect2[i]);
                     dot += static_cast<int64_t>(a) * b;
+                    sum_xi += static_cast<int64_t>(a);
+                    sum_yi += static_cast<int64_t>(b);
                 }
 
-                int64_t sum_ai_yi = 0;
-                int64_t sum_bi_xi = 0;
+                int64_t sum_pos_ai_yi = 0;
+                int64_t sum_pos_bi_xi = 0;
                 const size_t word_count = get_sign_word_count(qty);
                 for(size_t w = 0; w < word_count; ++w) {
                     const size_t base = w * 64;
@@ -188,7 +193,7 @@ namespace ndd {
                     while(active1 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active1));
                         const size_t idx = base + bit;
-                        sum_ai_yi += static_cast<int64_t>(pVect2[idx]);
+                        sum_pos_ai_yi += static_cast<int64_t>(pVect2[idx]);
                         active1 &= (active1 - 1ULL);
                     }
 
@@ -196,10 +201,16 @@ namespace ndd {
                     while(active2 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active2));
                         const size_t idx = base + bit;
-                        sum_bi_xi += static_cast<int64_t>(pVect1[idx]);
+                        sum_pos_bi_xi += static_cast<int64_t>(pVect1[idx]);
                         active2 &= (active2 - 1ULL);
                     }
                 }
+
+                // Convert stored 0/1 bits into centered signs {-1, +1}:
+                // sum(ai * yi) = 2 * sum(yi where ai_bit=1) - sum(yi)
+                // sum(bi * xi) = 2 * sum(xi where bi_bit=1) - sum(xi)
+                const int64_t sum_ai_yi = (sum_pos_ai_yi << 1) - sum_yi;
+                const int64_t sum_bi_xi = (sum_pos_bi_xi << 1) - sum_xi;
 
                 const float base = static_cast<float>(dot) * scale1 * scale2;
                 const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
