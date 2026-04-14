@@ -174,15 +174,95 @@ namespace ndd {
 
                 const float scale1 = extract_scale(pVect1, qty);
                 const float scale2 = extract_scale(pVect2, qty);
+                const uint64_t* bits1 = extract_sign_words(pVect1, qty);
+                const uint64_t* bits2 = extract_sign_words(pVect2, qty);
 
-                float res = 0.0f;
+                int64_t dot = 0;
+                int64_t sum_x2 = 0;
+                int64_t sum_y2 = 0;
+                int64_t sum_xi = 0;
+                int64_t sum_yi = 0;
+
                 for(size_t i = 0; i < qty; ++i) {
-                    const float v1 = static_cast<float>(get_q4(pVect1, i)) * scale1;
-                    const float v2 = static_cast<float>(get_q4(pVect2, i)) * scale2;
-                    const float diff = v1 - v2;
-                    res += diff * diff;
+                    const int32_t x = static_cast<int32_t>(get_q4(pVect1, i));
+                    const int32_t y = static_cast<int32_t>(get_q4(pVect2, i));
+                    dot += static_cast<int64_t>(x) * y;
+                    sum_x2 += static_cast<int64_t>(x) * x;
+                    sum_y2 += static_cast<int64_t>(y) * y;
+                    sum_xi += static_cast<int64_t>(x);
+                    sum_yi += static_cast<int64_t>(y);
                 }
-                return res;
+
+                int64_t sum_pos_ai_yi = 0;
+                int64_t sum_pos_bi_xi = 0;
+                int64_t sum_pos_ai_xi = 0;
+                int64_t sum_pos_bi_yi = 0;
+                int64_t sum_ai_bi = 0;
+
+                const size_t word_count = get_sign_word_count(qty);
+                for(size_t w = 0; w < word_count; ++w) {
+                    const size_t base = w * 64;
+                    uint64_t mask = ~0ULL;
+                    if(base + 64 > qty) {
+                        const size_t remaining = qty - base;
+                        mask = (remaining == 64) ? ~0ULL : ((1ULL << remaining) - 1ULL);
+                    }
+
+                    const uint64_t b1 = bits1[w] & mask;
+                    const uint64_t b2 = bits2[w] & mask;
+
+                    const int64_t remaining =
+                            static_cast<int64_t>((base + 64 <= qty) ? 64 : (qty - base));
+                    const int64_t diff = static_cast<int64_t>(__builtin_popcountll(b1 ^ b2));
+                    sum_ai_bi += remaining - (diff << 1);
+
+                    uint64_t active1 = b1;
+                    while(active1 != 0ULL) {
+                        const size_t bit = static_cast<size_t>(__builtin_ctzll(active1));
+                        const size_t idx = base + bit;
+                        const int64_t x = static_cast<int64_t>(get_q4(pVect1, idx));
+                        const int64_t y = static_cast<int64_t>(get_q4(pVect2, idx));
+                        sum_pos_ai_yi += y;
+                        sum_pos_ai_xi += x;
+                        active1 &= (active1 - 1ULL);
+                    }
+
+                    uint64_t active2 = b2;
+                    while(active2 != 0ULL) {
+                        const size_t bit = static_cast<size_t>(__builtin_ctzll(active2));
+                        const size_t idx = base + bit;
+                        const int64_t x = static_cast<int64_t>(get_q4(pVect1, idx));
+                        const int64_t y = static_cast<int64_t>(get_q4(pVect2, idx));
+                        sum_pos_bi_xi += x;
+                        sum_pos_bi_yi += y;
+                        active2 &= (active2 - 1ULL);
+                    }
+                }
+
+                const int64_t sum_ai_yi = (sum_pos_ai_yi << 1) - sum_yi;
+                const int64_t sum_bi_xi = (sum_pos_bi_xi << 1) - sum_xi;
+                const int64_t sum_ai_xi = (sum_pos_ai_xi << 1) - sum_xi;
+                const int64_t sum_bi_yi = (sum_pos_bi_yi << 1) - sum_yi;
+
+                const float s1s1 = scale1 * scale1;
+                const float s2s2 = scale2 * scale2;
+                const float s1s2 = scale1 * scale2;
+
+                const float base = static_cast<float>(sum_x2) * s1s1
+                                   + static_cast<float>(sum_y2) * s2s2
+                                   - 2.0f * static_cast<float>(dot) * s1s2;
+
+                // Linear correction from ai/4 and bi/4 terms.
+                const float linear = 0.5f
+                                     * (static_cast<float>(sum_ai_xi) * s1s1
+                                        + static_cast<float>(sum_bi_yi) * s2s2
+                                        - static_cast<float>(sum_ai_yi + sum_bi_xi) * s1s2);
+
+                // Quadratic correction from (ai/4)^2, (bi/4)^2, and ai*bi/16 terms.
+                const float quadratic = (static_cast<float>(qty) * 0.0625f) * (s1s1 + s2s2)
+                                        - 0.125f * static_cast<float>(sum_ai_bi) * s1s2;
+
+                return base + linear + quadratic;
             }
 
             static float L2SqrSim(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
@@ -214,6 +294,7 @@ namespace ndd {
 
                 int64_t sum_pos_ai_yi = 0;
                 int64_t sum_pos_bi_xi = 0;
+                int64_t sum_ai_bi = 0;
                 const size_t word_count = get_sign_word_count(qty);
                 for(size_t w = 0; w < word_count; ++w) {
                     const size_t base = w * 64;
@@ -223,7 +304,15 @@ namespace ndd {
                         mask = (remaining == 64) ? ~0ULL : ((1ULL << remaining) - 1ULL);
                     }
 
-                    uint64_t active1 = bits1[w] & mask;
+                    const uint64_t b1 = bits1[w] & mask;
+                    const uint64_t b2 = bits2[w] & mask;
+
+                    const int64_t remaining =
+                            static_cast<int64_t>((base + 64 <= qty) ? 64 : (qty - base));
+                    const int64_t diff = static_cast<int64_t>(__builtin_popcountll(b1 ^ b2));
+                    sum_ai_bi += remaining - (diff << 1);
+
+                    uint64_t active1 = b1;
                     while(active1 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active1));
                         const size_t idx = base + bit;
@@ -231,7 +320,7 @@ namespace ndd {
                         active1 &= (active1 - 1ULL);
                     }
 
-                    uint64_t active2 = bits2[w] & mask;
+                    uint64_t active2 = b2;
                     while(active2 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active2));
                         const size_t idx = base + bit;
@@ -249,7 +338,8 @@ namespace ndd {
                 const float base = static_cast<float>(dot) * scale1 * scale2;
                 const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi)
                                          * scale1 * scale2;
-                return base + correction;
+                const float quadratic = 0.0625f * static_cast<float>(sum_ai_bi) * scale1 * scale2;
+                return base + correction + quadratic;
             }
 
             static float
