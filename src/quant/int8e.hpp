@@ -125,8 +125,14 @@ namespace ndd {
                 std::vector<float> out(dimension);
                 const int8_t* data_ptr = reinterpret_cast<const int8_t*>(buffer);
                 const float scale = extract_scale(buffer, dimension);
+                const uint64_t* sign_words = extract_sign_words(buffer, dimension);
                 for(size_t i = 0; i < dimension; ++i) {
-                    out[i] = static_cast<float>(data_ptr[i]) * scale;
+                    const size_t word = i >> 6;
+                    const size_t bit = i & 63;
+                    const float residual_center = ((sign_words[word] >> bit) & 1ULL) != 0ULL
+                                                          ? 0.25f
+                                                          : -0.25f;
+                    out[i] = (static_cast<float>(data_ptr[i]) + residual_center) * scale;
                 }
                 // This rotation is self-inverse, so applying it restores original orientation.
                 rotate_pairwise_inplace(out);
@@ -611,6 +617,7 @@ namespace ndd {
 
                 int64_t sum_pos_ai_yi = 0;
                 int64_t sum_pos_bi_xi = 0;
+                int64_t sum_ai_bi = 0;
                 const size_t word_count = get_sign_word_count(qty);
                 for(size_t w = 0; w < word_count; ++w) {
                     const size_t base = w * 64;
@@ -620,7 +627,15 @@ namespace ndd {
                         mask = (remaining == 64) ? ~0ULL : ((1ULL << remaining) - 1ULL);
                     }
 
-                    uint64_t active1 = bits1[w] & mask;
+                    const uint64_t b1 = bits1[w] & mask;
+                    const uint64_t b2 = bits2[w] & mask;
+
+                    const int64_t remaining =
+                            static_cast<int64_t>((base + 64 <= qty) ? 64 : (qty - base));
+                    const int64_t diff = static_cast<int64_t>(__builtin_popcountll(b1 ^ b2));
+                    sum_ai_bi += remaining - (diff << 1);
+
+                    uint64_t active1 = b1;
                     while(active1 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active1));
                         const size_t idx = base + bit;
@@ -628,7 +643,7 @@ namespace ndd {
                         active1 &= (active1 - 1ULL);
                     }
 
-                    uint64_t active2 = bits2[w] & mask;
+                    uint64_t active2 = b2;
                     while(active2 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active2));
                         const size_t idx = base + bit;
@@ -646,7 +661,8 @@ namespace ndd {
                 const float base = static_cast<float>(dot) * scale1 * scale2;
                 const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
                                          scale1 * scale2;
-                return base + correction;
+                const float quadratic = 0.0625f * static_cast<float>(sum_ai_bi) * scale1 * scale2;
+                return base + correction + quadratic;
             }
 
             static float
@@ -692,10 +708,18 @@ namespace ndd {
                 }
             }
 
-            static std::vector<uint8_t> quantize_to_int8_identity(const void* in, size_t dim) {
-                size_t size = get_storage_size(dim);
-                const uint8_t* ptr = static_cast<const uint8_t*>(in);
-                return std::vector<uint8_t>(ptr, ptr + size);
+            static std::vector<uint8_t> quantize_to_int8(const void* in, size_t dim) {
+                const uint8_t* src = static_cast<const uint8_t*>(in);
+                std::vector<uint8_t> out(int8::get_storage_size(dim));
+
+                std::copy(src, src + dim * sizeof(int8_t), out.data());
+
+                const float scale = extract_scale(src, dim);
+                float* scale_ptr =
+                    reinterpret_cast<float*>(out.data() + dim * sizeof(int8_t));
+                *scale_ptr = scale;
+
+                return out;
             }
 
         }  // namespace int8e
@@ -720,7 +744,7 @@ namespace ndd {
                 d.sim_cosine_batch = &int8e::CosineSimBatch;
                 d.quantize = &int8e::quantize;
                 d.dequantize = &int8e::dequantize;
-                d.quantize_to_int8 = &int8e::quantize_to_int8_identity;
+                d.quantize_to_int8 = &int8e::quantize_to_int8;
                 d.get_storage_size = &int8e::get_storage_size;
                 d.extract_scale = &int8e::extract_scale;
                 return d;
