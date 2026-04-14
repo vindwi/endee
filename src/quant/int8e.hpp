@@ -180,25 +180,16 @@ namespace ndd {
 
                 int64_t sum_pos_ai_yi = 0;
                 int64_t sum_pos_bi_xi = 0;
-                int64_t sum_ai_bi = 0;
                 const size_t word_count = get_sign_word_count(qty);
                 for(size_t w = 0; w < word_count; ++w) {
                     const size_t base = w * 64;
                     uint64_t mask = ~0ULL;
-                    size_t valid_bits = 64;
                     if(base + 64 > qty) {
                         const size_t remaining = qty - base;
-                        valid_bits = remaining;
                         mask = (remaining == 64) ? ~0ULL : ((1ULL << remaining) - 1ULL);
                     }
 
-                    const uint64_t word1 = bits1[w] & mask;
-                    const uint64_t word2 = bits2[w] & mask;
-                    const uint64_t xor_bits = word1 ^ word2;
-                    const int64_t diff_bits = static_cast<int64_t>(__builtin_popcountll(xor_bits));
-                    sum_ai_bi += static_cast<int64_t>(valid_bits) - (diff_bits << 1);
-
-                    uint64_t active1 = word1;
+                    uint64_t active1 = bits1[w] & mask;
                     while(active1 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active1));
                         const size_t idx = base + bit;
@@ -206,7 +197,7 @@ namespace ndd {
                         active1 &= (active1 - 1ULL);
                     }
 
-                    uint64_t active2 = word2;
+                    uint64_t active2 = bits2[w] & mask;
                     while(active2 != 0ULL) {
                         const size_t bit = static_cast<size_t>(__builtin_ctzll(active2));
                         const size_t idx = base + bit;
@@ -224,8 +215,7 @@ namespace ndd {
                 const float base = static_cast<float>(dot) * scale1 * scale2;
                 const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
                                          scale1 * scale2;
-                const float error_term = 0.0625f * static_cast<float>(sum_ai_bi) * scale1 * scale2;
-                return base + correction + error_term;
+                return base + correction;
             }
 
             static float
