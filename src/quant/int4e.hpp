@@ -150,8 +150,15 @@ namespace ndd {
                 std::vector<float> out(dimension);
                 const uint8_t* packed_ptr = buffer;
                 const float scale = extract_scale(buffer, dimension);
+                const uint64_t* sign_words = extract_sign_words(buffer, dimension);
                 for(size_t i = 0; i < dimension; ++i) {
-                    out[i] = static_cast<float>(get_q4(packed_ptr, i)) * scale;
+                    const size_t word = i >> 6;
+                    const size_t bit = i & 63;
+                    const float residual_center = ((sign_words[word] >> bit) & 1ULL) != 0ULL
+                                                          ? 0.25f
+                                                          : -0.25f;
+                    out[i] = (static_cast<float>(get_q4(packed_ptr, i)) + residual_center)
+                             * scale;
                 }
                 // This rotation is self-inverse, so applying it restores original orientation.
                 rotate_pairwise_inplace(out);

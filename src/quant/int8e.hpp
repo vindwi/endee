@@ -117,14 +117,58 @@ namespace ndd {
 
             inline std::vector<uint8_t>
             quantize_vector_fp32_to_int8_buffer_auto(const std::vector<float>& input) {
-                return quantize_vector_fp32_to_int8_buffer(input);
+                if(input.empty()) {
+                    return std::vector<uint8_t>();
+                }
+
+                std::vector<float> rotated = input;
+                rotate_pairwise_inplace(rotated);
+
+                const size_t dimension = rotated.size();
+                std::vector<uint8_t> base = int8::quantize_vector_fp32_to_int8_buffer_auto(rotated);
+                std::vector<uint8_t> buffer(get_storage_size(dimension));
+
+                int8_t* data_ptr = reinterpret_cast<int8_t*>(buffer.data());
+                const int8_t* base_data = reinterpret_cast<const int8_t*>(base.data());
+                std::copy(base_data, base_data + dimension, data_ptr);
+
+                uint64_t* sign_words = extract_sign_words(buffer.data(), dimension);
+                const size_t sign_word_count = get_sign_word_count(dimension);
+                for(size_t w = 0; w < sign_word_count; ++w) {
+                    sign_words[w] = 0ULL;
+                }
+
+                const float scale = int8::extract_scale(base.data(), dimension);
+                const float inv_scale = 1.0f / scale;
+                for(size_t i = 0; i < dimension; ++i) {
+                    const float scaled_real = rotated[i] * inv_scale;
+                    const float residual = scaled_real - static_cast<float>(data_ptr[i]);
+                    if(residual >= 0.0f) {
+                        const size_t word = i >> 6;
+                        const size_t bit = i & 63;
+                        sign_words[word] |= (1ULL << bit);
+                    }
+                }
+
+                float* scale_ptr =
+                        reinterpret_cast<float*>(buffer.data() + (dimension * sizeof(int8_t))
+                                                 + get_sign_storage_size(dimension));
+                *scale_ptr = scale;
+
+                return buffer;
             }
 
             inline std::vector<float> dequantize_int8_buffer_to_fp32(const uint8_t* buffer,
                                                                      size_t dimension) {
-                std::vector<float> out(dimension);
-                const int8_t* data_ptr = reinterpret_cast<const int8_t*>(buffer);
+                std::vector<uint8_t> base(int8::get_storage_size(dimension));
+                std::copy(buffer, buffer + dimension * sizeof(int8_t), base.data());
+
                 const float scale = extract_scale(buffer, dimension);
+                float* base_scale_ptr =
+                        reinterpret_cast<float*>(base.data() + dimension * sizeof(int8_t));
+                *base_scale_ptr = scale;
+
+                std::vector<float> out = int8::dequantize_int8_buffer_to_fp32(base.data(), dimension);
                 const uint64_t* sign_words = extract_sign_words(buffer, dimension);
                 for(size_t i = 0; i < dimension; ++i) {
                     const size_t word = i >> 6;
@@ -132,7 +176,7 @@ namespace ndd {
                     const float residual_center = ((sign_words[word] >> bit) & 1ULL) != 0ULL
                                                           ? 0.25f
                                                           : -0.25f;
-                    out[i] = (static_cast<float>(data_ptr[i]) + residual_center) * scale;
+                    out[i] += residual_center * scale;
                 }
                 // This rotation is self-inverse, so applying it restores original orientation.
                 rotate_pairwise_inplace(out);
