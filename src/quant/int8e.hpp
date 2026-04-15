@@ -36,8 +36,8 @@ namespace ndd {
             }
 
             constexpr size_t get_storage_size(size_t dimension) {
-                return dimension * sizeof(int8_t) + get_sign_storage_size(dimension) +
-                       sizeof(float);
+                return dimension * sizeof(int8_t) + get_sign_storage_size(dimension)
+                       + sizeof(float);
             }
 
             inline const uint64_t* extract_sign_words(const uint8_t* buffer, size_t dimension) {
@@ -50,18 +50,9 @@ namespace ndd {
 
             inline float extract_scale(const uint8_t* buffer, size_t dimension) {
                 const size_t sign_bytes = get_sign_storage_size(dimension);
-                return *reinterpret_cast<const float*>(buffer + dimension * sizeof(int8_t) +
-                                                       sign_bytes);
+                return *reinterpret_cast<const float*>(buffer + dimension * sizeof(int8_t)
+                                                       + sign_bytes);
             }
-
-#if defined(USE_NEON)
-            inline int64_t horizontal_sum_s32x4(int32x4_t v) {
-                int32_t lanes[4];
-                vst1q_s32(lanes, v);
-                return static_cast<int64_t>(lanes[0]) + static_cast<int64_t>(lanes[1])
-                       + static_cast<int64_t>(lanes[2]) + static_cast<int64_t>(lanes[3]);
-            }
-#endif
 
             // Quantize with nearest rounding and store sign(residual) bits,
             // where residual = real - rounded:
@@ -75,31 +66,25 @@ namespace ndd {
                 std::vector<float> rotated = input;
                 rotate_pairwise_inplace(rotated);
 
-                size_t dimension = rotated.size();
-                size_t buffer_size = get_storage_size(dimension);
-                std::vector<uint8_t> buffer(buffer_size);
-                const size_t sign_word_count = get_sign_word_count(dimension);
-
-                float abs_max = ndd::quant::math::find_abs_max(rotated.data(), dimension);
-                if(abs_max == 0.0f) {
-                    abs_max = 1.0f;
-                }
-                float scale = abs_max / INT8_SCALE;
-                float inv_scale = 1.0f / scale;
+                const size_t dimension = rotated.size();
+                std::vector<uint8_t> base = int8::quantize_vector_fp32_to_int8_buffer(rotated);
+                std::vector<uint8_t> buffer(get_storage_size(dimension));
 
                 int8_t* data_ptr = reinterpret_cast<int8_t*>(buffer.data());
+                const int8_t* base_data = reinterpret_cast<const int8_t*>(base.data());
+                std::copy(base_data, base_data + dimension, data_ptr);
+
                 uint64_t* sign_words = extract_sign_words(buffer.data(), dimension);
+                const size_t sign_word_count = get_sign_word_count(dimension);
                 for(size_t w = 0; w < sign_word_count; ++w) {
                     sign_words[w] = 0ULL;
                 }
 
+                const float scale = int8::extract_scale(base.data(), dimension);
+                const float inv_scale = 1.0f / scale;
                 for(size_t i = 0; i < dimension; ++i) {
-                    float scaled_real = rotated[i] * inv_scale;
-                    float scaled = std::round(scaled_real);
-                    float clamped = std::max(-127.0f, std::min(127.0f, scaled));
-                    data_ptr[i] = static_cast<int8_t>(clamped);
-
-                    const float residual = scaled_real - clamped;
+                    const float scaled_real = rotated[i] * inv_scale;
+                    const float residual = scaled_real - static_cast<float>(data_ptr[i]);
                     if(residual >= 0.0f) {
                         const size_t word = i >> 6;
                         const size_t bit = i & 63;
@@ -108,8 +93,8 @@ namespace ndd {
                 }
 
                 float* scale_ptr =
-                        reinterpret_cast<float*>(buffer.data() + (dimension * sizeof(int8_t)) +
-                                                 get_sign_storage_size(dimension));
+                        reinterpret_cast<float*>(buffer.data() + (dimension * sizeof(int8_t))
+                                                 + get_sign_storage_size(dimension));
                 *scale_ptr = scale;
 
                 return buffer;
