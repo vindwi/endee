@@ -459,9 +459,8 @@ namespace ndd {
                                         - static_cast<float>(sum_ai_yi + sum_bi_xi) * s1s2);
 
                 // Quadratic correction from (ai/4)^2, (bi/4)^2, and ai*bi/16 terms.
-                // const float quadratic = (static_cast<float>(qty) * 0.0625f) * (s1s1 + s2s2)
-                //                         - 0.125f * static_cast<float>(sum_ai_bi) * s1s2;
-                const float quadratic = 0.0f;
+                const float quadratic = (static_cast<float>(qty) * 0.0625f) * (s1s1 + s2s2)
+                                        - 0.125f * static_cast<float>(sum_ai_bi) * s1s2;
 
                 return base + linear + quadratic;
             }
@@ -691,9 +690,7 @@ namespace ndd {
                 const float base = static_cast<float>(dot) * scale1 * scale2;
                 const float correction = 0.25f * static_cast<float>(sum_ai_yi + sum_bi_xi) *
                                          scale1 * scale2;
-                // const float quadratic = 0.0625f * static_cast<float>(sum_ai_bi) * scale1
-                //                        * scale2;
-                const float quadratic = 0.0f;
+                const float quadratic = 0.0625f * static_cast<float>(sum_ai_bi) * scale1 * scale2;
                 return base + correction + quadratic;
             }
 
