@@ -13,6 +13,7 @@ namespace ndd {
         namespace int8e {
 
             constexpr float INT8_SCALE = 127.0f;
+            constexpr float INV_SQRT2 = 0.7071067811865475f;
 
             constexpr size_t get_sign_word_count(size_t dimension) {
                 return (dimension + 63) / 64;
@@ -20,6 +21,17 @@ namespace ndd {
 
             constexpr size_t get_sign_storage_size(size_t dimension) {
                 return get_sign_word_count(dimension) * sizeof(uint64_t);
+            }
+
+            inline void rotate_pairwise_inplace(std::vector<float>& values) {
+                const size_t dimension = values.size();
+                const size_t paired = (dimension / 2) * 2;
+                for(size_t i = 0; i < paired; i += 2) {
+                    const float x = values[i];
+                    const float y = values[i + 1];
+                    values[i] = (x + y) * INV_SQRT2;
+                    values[i + 1] = (x - y) * INV_SQRT2;
+                }
             }
 
             constexpr size_t get_storage_size(size_t dimension) {
@@ -48,10 +60,13 @@ namespace ndd {
                     return std::vector<uint8_t>();
                 }
 
-                const size_t dimension = input.size();
+                std::vector<float> rotated = input;
+                rotate_pairwise_inplace(rotated);
+
+                const size_t dimension = rotated.size();
                 std::vector<uint8_t> buffer(get_storage_size(dimension));
 
-                float abs_max = ndd::quant::math::find_abs_max(input.data(), dimension);
+                float abs_max = ndd::quant::math::find_abs_max(rotated.data(), dimension);
                 if(abs_max == 0.0f) {
                     abs_max = 1.0f;
                 }
@@ -67,7 +82,7 @@ namespace ndd {
                 }
 
                 for(size_t i = 0; i < dimension; ++i) {
-                    const float scaled_real = input[i] * inv_scale;
+                    const float scaled_real = rotated[i] * inv_scale;
                     const int8_t q = static_cast<int8_t>(std::round(scaled_real));
                     data_ptr[i] = q;
 
@@ -107,6 +122,8 @@ namespace ndd {
                                                           : -0.25f;
                     out[i] = (static_cast<float>(payload[i]) + residual_center) * scale;
                 }
+
+                rotate_pairwise_inplace(out);
 
                 return out;
             }
