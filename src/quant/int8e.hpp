@@ -290,19 +290,27 @@ namespace ndd {
                     _mm_storeu_si128((__m128i*)(data_ptr + i + 32), _mm512_cvtepi32_epi8(q2));
                     _mm_storeu_si128((__m128i*)(data_ptr + i + 48), _mm512_cvtepi32_epi8(q3));
 
-                    // Residual = scaled − round(scaled); sign bit = (residual ≥ 0)
-                    // _mm512_cmpge_ps_mask returns a 16-bit mask; pack four into one uint64.
+                        // Residual = scaled − round(scaled); sign bit = (residual >= 0)
+                        // _mm512_cmp_ps_mask returns a 16-bit lane mask; pack four into one uint64.
                     sign_words[i >> 6] =
-                            (uint64_t)(uint16_t)_mm512_cmpge_ps_mask(
-                                    _mm512_sub_ps(s0, _mm512_cvtepi32_ps(q0)), zero_vec)
-                            | ((uint64_t)(uint16_t)_mm512_cmpge_ps_mask(
-                                       _mm512_sub_ps(s1, _mm512_cvtepi32_ps(q1)), zero_vec)
+                            (uint64_t)(uint16_t)_mm512_cmp_ps_mask(
+                                _mm512_sub_ps(s0, _mm512_cvtepi32_ps(q0)),
+                                zero_vec,
+                                _CMP_GE_OQ)
+                            | ((uint64_t)(uint16_t)_mm512_cmp_ps_mask(
+                                   _mm512_sub_ps(s1, _mm512_cvtepi32_ps(q1)),
+                                   zero_vec,
+                                   _CMP_GE_OQ)
                                << 16)
-                            | ((uint64_t)(uint16_t)_mm512_cmpge_ps_mask(
-                                       _mm512_sub_ps(s2, _mm512_cvtepi32_ps(q2)), zero_vec)
+                            | ((uint64_t)(uint16_t)_mm512_cmp_ps_mask(
+                                   _mm512_sub_ps(s2, _mm512_cvtepi32_ps(q2)),
+                                   zero_vec,
+                                   _CMP_GE_OQ)
                                << 32)
-                            | ((uint64_t)(uint16_t)_mm512_cmpge_ps_mask(
-                                       _mm512_sub_ps(s3, _mm512_cvtepi32_ps(q3)), zero_vec)
+                            | ((uint64_t)(uint16_t)_mm512_cmp_ps_mask(
+                                   _mm512_sub_ps(s3, _mm512_cvtepi32_ps(q3)),
+                                   zero_vec,
+                                   _CMP_GE_OQ)
                                << 48);
                 }
 
@@ -502,10 +510,9 @@ namespace ndd {
 #endif
 
 #if defined(USE_SVE2)
-            // SVE2: vectorised quantise + vectorised sign-bit extraction.
+            // SVE2: vectorized quantize with scalar sign-bit extraction.
             // Quantisation uses full-width SVE predicated loads/stores.
-            // Sign bits are extracted per 32-bit half of each sign word using svlsl + svaddv,
-            // which avoids a costly scalar pass over all N elements.
+            // Residual sign packing is scalar to guarantee correctness across all SVE widths.
             inline std::vector<uint8_t>
             quantize_vector_fp32_to_int8e_buffer_sve(const std::vector<float>& input) {
                 if(input.empty()) {
@@ -531,64 +538,40 @@ namespace ndd {
                 const size_t sign_word_count = get_sign_word_count(dimension);
                 for(size_t w = 0; w < sign_word_count; ++w) sign_words[w] = 0ULL;
 
-                // Pass 1: vectorised quantisation
+                // Pass 1: vectorized quantization on full SVE-width chunks.
+                // Remainder elements are handled in scalar to avoid partial-lane SIMD tails.
                 {
-                    size_t i  = 0;
-                    svbool_t pg = svwhilelt_b32(i, dimension);
-                    while(svptest_any(svptrue_b32(), pg)) {
-                        svfloat32_t v = svmul_n_f32_x(pg, svld1_f32(pg, &rotated[i]), inv_scale);
-                        v = svrinta_f32_x(pg, v);
-                        svint32_t q = svcvt_s32_f32_x(pg, v);
-                        q = svmin_s32_x(pg, q, svdup_s32(127));
-                        q = svmax_s32_x(pg, q, svdup_s32(-127));
-                        svst1b_s32(pg, &data_ptr[i], q);
-                        i  += svcntw();
-                        pg  = svwhilelt_b32(i, dimension);
+                    size_t i = 0;
+                    const size_t vecw = svcntw();
+                    for(; i + vecw <= dimension; i += vecw) {
+                        svfloat32_t v = svmul_n_f32_x(svptrue_b32(),
+                                                      svld1_f32(svptrue_b32(), &rotated[i]),
+                                                      inv_scale);
+                        v = svrinta_f32_x(svptrue_b32(), v);
+                        svint32_t q = svcvt_s32_f32_x(svptrue_b32(), v);
+                        q = svmin_s32_x(svptrue_b32(), q, svdup_s32(127));
+                        q = svmax_s32_x(svptrue_b32(), q, svdup_s32(-127));
+                        svst1b_s32(svptrue_b32(), &data_ptr[i], q);
+                    }
+
+                    for(; i < dimension; ++i) {
+                        const float scaled_real = rotated[i] * inv_scale;
+                        data_ptr[i] = static_cast<int8_t>(std::round(scaled_real));
                     }
                 }
 
-                // Pass 2: vectorised sign-bit extraction.
-                // Process each 64-bit sign word in two 32-element halves.
-                // For each half: shift 1u left by lane-index k and add across active lanes;
-                // since all shifted values are distinct powers-of-two, add == OR.
+                // Pass 2: residual-sign bit extraction.
+                // Use scalar bit packing for correctness across all possible SVE widths.
                 for(size_t w = 0; w < sign_word_count; ++w) {
                     const size_t base  = w * 64;
                     uint64_t sign_word = 0;
 
-                    // Lower 32 bits
-                    {
-                        const size_t end = std::min(base + 32, dimension);
-                        svbool_t pg = svwhilelt_b32(base, end);
-                        if(svptest_any(svptrue_b32(), pg)) {
-                            svfloat32_t s  = svmul_n_f32_x(pg, svld1_f32(pg, &rotated[base]),
-                                                           inv_scale);
-                            svfloat32_t qf = svcvt_f32_s32_x(
-                                    pg, svld1sb_s32(pg, &data_ptr[base]));
-                            svbool_t pos = svcmpge_f32(
-                                    pg, svsub_f32_x(pg, s, qf), svdup_f32(0.0f));
-                            svuint32_t shifted = svlsl_u32_x(
-                                    pg, svdup_u32(1u), svindex_u32(0, 1));
-                            svuint32_t sel = svsel_u32(pos, shifted, svdup_u32(0u));
-                            sign_word |= (uint64_t)svaddv_u32(pg, sel);
-                        }
-                    }
-
-                    // Upper 32 bits
-                    if(base + 32 < dimension) {
-                        const size_t start32 = base + 32;
-                        const size_t end     = std::min(base + 64, dimension);
-                        svbool_t pg = svwhilelt_b32(start32, end);
-                        if(svptest_any(svptrue_b32(), pg)) {
-                            svfloat32_t s  = svmul_n_f32_x(
-                                    pg, svld1_f32(pg, &rotated[start32]), inv_scale);
-                            svfloat32_t qf = svcvt_f32_s32_x(
-                                    pg, svld1sb_s32(pg, &data_ptr[start32]));
-                            svbool_t pos = svcmpge_f32(
-                                    pg, svsub_f32_x(pg, s, qf), svdup_f32(0.0f));
-                            svuint32_t shifted = svlsl_u32_x(
-                                    pg, svdup_u32(1u), svindex_u32(0, 1));
-                            svuint32_t sel = svsel_u32(pos, shifted, svdup_u32(0u));
-                            sign_word |= ((uint64_t)svaddv_u32(pg, sel) << 32);
+                    const size_t end = std::min(base + 64, dimension);
+                    for(size_t idx = base; idx < end; ++idx) {
+                        const float scaled_real = rotated[idx] * inv_scale;
+                        const float residual = scaled_real - static_cast<float>(data_ptr[idx]);
+                        if(residual >= 0.0f) {
+                            sign_word |= (1ULL << (idx - base));
                         }
                     }
 
@@ -849,10 +832,9 @@ namespace ndd {
 #endif
 
 #if defined(USE_SVE2)
-            // SVE2 dequantize + vectorised sign correction.
-            // Sign correction processes each 64-bit sign word in two 32-element halves:
-            // svlsl shifts 1u left by the lane index to isolate each bit, svand checks it,
-            // and svsel picks +corr or -corr per lane.
+            // SVE2 dequantize with scalar sign correction.
+            // Dequantization remains vectorized; sign correction is scalar for correctness
+            // across all SVE vector lengths.
             inline std::vector<float> dequantize_int8e_buffer_to_fp32_sve(const uint8_t* buffer,
                                                                           size_t dimension) {
                 std::vector<float> out(dimension);
@@ -860,22 +842,26 @@ namespace ndd {
                 const uint64_t* sign_words = extract_sign_words(buffer, dimension);
                 const float     scale      = extract_scale(buffer, dimension);
 
-                // Vectorised dequantize
+                // Vectorized dequantize on full SVE-width chunks.
+                // Remainder elements are handled in scalar.
                 {
-                    size_t   i  = 0;
-                    svbool_t pg = svwhilelt_b32(i, dimension);
-                    while(svptest_any(svptrue_b32(), pg)) {
-                        svint32_t   i32 = svld1sb_s32(pg, payload + i);
-                        svfloat32_t f   = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, i32), scale);
-                        svst1_f32(pg, &out[i], f);
-                        i  += svcntw();
-                        pg  = svwhilelt_b32(i, dimension);
+                    size_t i = 0;
+                    const size_t vecw = svcntw();
+                    for(; i + vecw <= dimension; i += vecw) {
+                        svint32_t i32 = svld1sb_s32(svptrue_b32(), payload + i);
+                        svfloat32_t f = svmul_n_f32_x(svptrue_b32(),
+                                                      svcvt_f32_s32_x(svptrue_b32(), i32),
+                                                      scale);
+                        svst1_f32(svptrue_b32(), &out[i], f);
+                    }
+
+                    for(; i < dimension; ++i) {
+                        out[i] = static_cast<float>(payload[i]) * scale;
                     }
                 }
 
-                // Vectorised sign correction.
-                // Process each sign word in two 32-element halves using variable left-shift
-                // to extract bit k and svsel to choose the correction value per lane.
+                // Sign correction.
+                // Use scalar correction for full correctness across all SVE widths.
                 const float  corr = 0.25f * scale;
                 const size_t wc   = get_sign_word_count(dimension);
 
@@ -883,40 +869,9 @@ namespace ndd {
                     const uint64_t wv   = sign_words[w];
                     const size_t   base = w * 64;
 
-                    // Lower 32 bits of sign word
-                    {
-                        const size_t end = std::min(base + 32, dimension);
-                        svbool_t pg32    = svwhilelt_b32(base, end);
-                        if(svptest_any(svptrue_b32(), pg32)) {
-                            // shifted[k] = 1u << k; AND with the lower 32 bits of wv
-                            svuint32_t bits = svand_n_u32_x(
-                                    pg32,
-                                    svlsl_u32_x(pg32, svdup_u32(1u), svindex_u32(0, 1)),
-                                    (uint32_t)wv);
-                            svfloat32_t c = svsel_f32(
-                                    svcmpne_n_u32(pg32, bits, 0u),
-                                    svdup_f32(corr), svdup_f32(-corr));
-                            svst1_f32(pg32, &out[base],
-                                      svadd_f32_x(pg32, svld1_f32(pg32, &out[base]), c));
-                        }
-                    }
-
-                    // Upper 32 bits of sign word
-                    if(base + 32 < dimension) {
-                        const size_t start32 = base + 32;
-                        const size_t end     = std::min(base + 64, dimension);
-                        svbool_t pg32        = svwhilelt_b32(start32, end);
-                        if(svptest_any(svptrue_b32(), pg32)) {
-                            svuint32_t bits = svand_n_u32_x(
-                                    pg32,
-                                    svlsl_u32_x(pg32, svdup_u32(1u), svindex_u32(0, 1)),
-                                    (uint32_t)(wv >> 32));
-                            svfloat32_t c = svsel_f32(
-                                    svcmpne_n_u32(pg32, bits, 0u),
-                                    svdup_f32(corr), svdup_f32(-corr));
-                            svst1_f32(pg32, &out[start32],
-                                      svadd_f32_x(pg32, svld1_f32(pg32, &out[start32]), c));
-                        }
+                    const size_t end = std::min(base + 64, dimension);
+                    for(size_t idx = base; idx < end; ++idx) {
+                        out[idx] += ((wv >> (idx - base)) & 1ULL) ? corr : -corr;
                     }
                 }
 
