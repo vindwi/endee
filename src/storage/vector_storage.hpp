@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <filesystem>
+#include <utility>
 
 // Handles vector storage
 class VectorStore {
@@ -250,6 +251,48 @@ public:
                 success[i] = false;
             }
         }
+
+        mdbx_txn_abort(txn);
+        return fetched;
+    }
+
+    // Zero-copy batch access: exposes MDBX-backed pointers valid only during callback execution.
+    template <typename Callback>
+    size_t with_vectors_batch_ptrs(const ndd::idInt* labels,
+                                   size_t count,
+                                   Callback&& callback) const {
+        if(count == 0) {
+            std::vector<const void*> empty_ptrs;
+            std::vector<bool> empty_success;
+            callback(empty_ptrs, empty_success);
+            return 0;
+        }
+
+        MDBX_txn* txn;
+        int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+        if(rc != MDBX_SUCCESS) {
+            std::vector<const void*> empty_ptrs;
+            std::vector<bool> empty_success(count, false);
+            callback(empty_ptrs, empty_success);
+            return 0;
+        }
+
+        size_t fetched = 0;
+        std::vector<const void*> ptrs(count, nullptr);
+        std::vector<bool> success(count, false);
+
+        for(size_t i = 0; i < count; ++i) {
+            MDBX_val key{const_cast<ndd::idInt*>(&labels[i]), sizeof(ndd::idInt)};
+            MDBX_val data;
+            rc = mdbx_get(txn, dbi_, &key, &data);
+            if(rc == MDBX_SUCCESS && data.iov_len == bytes_per_vector_) {
+                ptrs[i] = data.iov_base;
+                success[i] = true;
+                fetched++;
+            }
+        }
+
+        callback(ptrs, success);
 
         mdbx_txn_abort(txn);
         return fetched;
@@ -735,6 +778,14 @@ public:
     size_t get_vectors_batch_into(const ndd::idInt* labels, uint8_t* buffers,
                                   bool* success, size_t count) const {
         return vector_store_->get_vectors_batch_into(labels, buffers, success, count);
+    }
+
+    template <typename Callback>
+    size_t with_vectors_batch_ptrs(const ndd::idInt* labels,
+                                   size_t count,
+                                   Callback&& callback) const {
+        return vector_store_->with_vectors_batch_ptrs(
+                labels, count, std::forward<Callback>(callback));
     }
 
     std::vector<std::pair<ndd::idInt, std::vector<uint8_t>>>

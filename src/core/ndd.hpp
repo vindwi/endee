@@ -1562,18 +1562,63 @@ public:
                         return true;
                         }, &valid_ids);
 
-                         // Fetch vectors
-                        auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
+                        dense_results.clear();
+                        entry.vector_storage->with_vectors_batch_ptrs(
+                                valid_ids.data(),
+                                valid_ids.size(),
+                                [&](const std::vector<const void*>& ptrs,
+                                    const std::vector<bool>& success) {
+                                    std::vector<ndd::idInt> fetched_ids;
+                                    std::vector<const void*> vector_ptrs;
+                                    fetched_ids.reserve(ptrs.size());
+                                    vector_ptrs.reserve(ptrs.size());
 
-                        // Prepare subset for bruteforce search
-                        std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
-                        vector_subset.reserve(vector_batch.size());
-                        for(auto& [nid, vbytes] : vector_batch) {
-                            vector_subset.emplace_back(nid, std::move(vbytes));
-                        }
+                                    for(size_t i = 0; i < ptrs.size(); ++i) {
+                                        if(!success[i] || !ptrs[i]) {
+                                            continue;
+                                        }
+                                        fetched_ids.push_back(valid_ids[i]);
+                                        vector_ptrs.push_back(ptrs[i]);
+                                    }
 
-                        dense_results = hnswlib::searchKnnSubset<float>(
-                            query_bytes.data(), vector_subset, k, space);
+                                    if(vector_ptrs.empty()) {
+                                        return;
+                                    }
+
+                                    std::vector<float> sims;
+                                    entry.alg->computeBatchSimilaritiesFromPtrs(query_bytes.data(),
+                                                                                vector_ptrs,
+                                                                                space->get_sim_func(),
+                                                                                space->get_dist_func_param(),
+                                                                                sims);
+
+                                    auto cmp = [](const std::pair<float, ndd::idInt>& a,
+                                                  const std::pair<float, ndd::idInt>& b) {
+                                        return a.first > b.first;
+                                    };
+                                    std::priority_queue<std::pair<float, ndd::idInt>,
+                                                        std::vector<std::pair<float, ndd::idInt>>,
+                                                        decltype(cmp)>
+                                            topk_min_heap(cmp);
+
+                                    for(size_t i = 0; i < sims.size(); ++i) {
+                                        const std::pair<float, ndd::idInt> candidate{sims[i],
+                                                                                      fetched_ids[i]};
+                                        if(topk_min_heap.size() < k) {
+                                            topk_min_heap.push(candidate);
+                                        } else if(candidate.first > topk_min_heap.top().first) {
+                                            topk_min_heap.pop();
+                                            topk_min_heap.push(candidate);
+                                        }
+                                    }
+
+                                    dense_results.reserve(topk_min_heap.size());
+                                    while(!topk_min_heap.empty()) {
+                                        dense_results.push_back(topk_min_heap.top());
+                                        topk_min_heap.pop();
+                                    }
+                                    std::reverse(dense_results.begin(), dense_results.end());
+                                });
 
                     } else {
                         // Strategy B: Filtered HNSW Search
